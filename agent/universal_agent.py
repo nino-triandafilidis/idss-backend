@@ -41,6 +41,25 @@ from .prompts import (
 logger = logging.getLogger("mcp.universal_agent")
 
 # ---------------------------------------------------------------------------
+# Brand-value normalisation: map common user aliases/shorthands → canonical brand name.
+# Applied after both LLM and regex extraction so that "mac", "macOS", "iMac" all become "Apple",
+# "thinkpad" becomes "Lenovo", etc.
+_BRAND_VALUE_ALIASES: Dict[str, str] = {
+    "mac": "Apple", "macs": "Apple", "macbook": "Apple", "macbooks": "Apple",
+    "mac air": "Apple", "mac pro": "Apple", "mac mini": "Apple",
+    "imac": "Apple", "macintosh": "Apple", "apple mac": "Apple",
+    "thinkpad": "Lenovo", "ideapad": "Lenovo",
+    "xps": "Dell", "inspiron": "Dell", "latitude": "Dell",
+    "rog": "ASUS", "zenbook": "ASUS", "vivobook": "ASUS",
+    "surface": "Microsoft",
+    "alienware": "Dell",
+    "spectre": "HP", "pavilion": "HP", "envy": "HP",
+    "aspire": "Acer", "swift": "Acer",
+    "aorus": "Gigabyte",
+    "dynabook": "Toshiba",
+}
+
+# ---------------------------------------------------------------------------
 # Slot-name normalisation: map common LLM alias → canonical schema slot name.
 # The LLM may return "ram" instead of "min_ram_gb", "price" instead of "budget",
 # etc. Without normalisation those end up in self.filters under wrong keys and
@@ -93,6 +112,70 @@ _SLOT_NAME_ALIASES: Dict[str, Dict[str, str]] = {
         "book_type": "format",
     },
 }
+
+# ---------------------------------------------------------------------------
+# Semantic brand extraction — used even in the regex-fallback path so that
+# natural language variations ("Mac", "MACS", "M2 chip laptop", "Apple Silicon",
+# "carbon X1", "Yoga Slim") resolve correctly without an ever-growing regex list.
+# ---------------------------------------------------------------------------
+
+_BRAND_EXTRACT_SYSTEM = (
+    "You are a brand extractor for an e-commerce search engine. "
+    "Given a user message, identify the laptop/computer manufacturer brand they prefer, if any. "
+    "Reply with ONLY the canonical manufacturer name from this list: "
+    "Apple, Dell, HP, Lenovo, ASUS, MSI, Razer, Microsoft, Samsung, Acer, Gigabyte, "
+    "Framework, System76, Toshiba, LG. "
+    "If no brand is mentioned, reply 'none'. "
+    "Examples:\n"
+    "  'show me mac laptops'  → Apple\n"
+    "  'MACS under 1000'      → Apple\n"
+    "  'M2 chip laptop'       → Apple\n"
+    "  'Apple Silicon'        → Apple\n"
+    "  'thinkpad carbon'      → Lenovo\n"
+    "  'lenovo yoga slim'     → Lenovo\n"
+    "  'HP gaming laptop'     → HP\n"
+    "  'xps 15'               → Dell\n"
+    "  'surface pro'          → Microsoft\n"
+    "  'cheapest laptop'      → none\n"
+    "Output ONLY the brand name or 'none' — no punctuation, no explanation."
+)
+
+_KNOWN_BRANDS = frozenset({
+    "Apple", "Dell", "HP", "Lenovo", "ASUS", "MSI", "Razer",
+    "Microsoft", "Samsung", "Acer", "Gigabyte", "Framework",
+    "System76", "Toshiba", "LG",
+})
+
+
+def _extract_brand_semantic(message: str) -> Optional[str]:
+    """
+    Use a tiny LLM call to extract the canonical brand from free-form text.
+
+    Handles ALL natural-language variations the user might type without an
+    ever-growing regex list.  Falls back to None on quota/network error so
+    the caller can try the regex patterns as a last resort.
+
+    Cost: ~$0.000003 per call (gpt-4o-mini, max_tokens=10).
+    """
+    try:
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": _BRAND_EXTRACT_SYSTEM},
+                {"role": "user", "content": message},
+            ],
+            max_tokens=10,
+            temperature=0,
+        )
+        raw = (resp.choices[0].message.content or "").strip().strip('"').strip("'")
+        if raw.lower() in ("none", "no brand", "unknown", ""):
+            return None
+        # Accept only known brands to guard against hallucination
+        return raw if raw in _KNOWN_BRANDS else None
+    except Exception:
+        return None
+
 
 # Model configuration — single model for all LLM calls, set via environment
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
@@ -390,6 +473,23 @@ class UniversalAgent:
             # Reset domain so we try again next time
             self.domain = None
             return response
+
+        # ── "Changed my mind" preference reset ──────────────────────────────────
+        # If the user signals a preference change mid-session (same domain), clear
+        # soft slot values (brand, use_case) so the new preference fully replaces the
+        # old one.  Budget and RAM are kept (user hasn't said they changed those).
+        _PREF_RESET_PHRASES = (
+            "changed my mind", "change my mind", "actually", "instead show",
+            "show me instead", "forget that", "never mind", "nevermind",
+            "scratch that", "different brand", "switch to", "go with",
+        )
+        msg_lower_chk = message.lower()
+        if any(p in msg_lower_chk for p in _PREF_RESET_PHRASES) and self.domain:
+            # Clear only the soft preferences — keep hard constraints (budget, RAM, screen_size)
+            _soft_slots = {"brand", "use_case", "color", "os", "product_subtype"}
+            for slot in _soft_slots:
+                self.filters.pop(slot, None)
+            logger.info(f"Preference reset detected — cleared soft slots: {_soft_slots}")
 
         # ── Accessory / subtype ambiguity check ─────────────────────────────────
         # If the user mentions a domain keyword AND an accessory keyword in the
@@ -737,6 +837,10 @@ class UniversalAgent:
                             f"Dropping unknown slot '{item.slot_name}' "
                             f"(canonical='{canonical}') — not in schema for domain '{schema.domain}'"
                         )
+                # Normalise brand value (e.g., "Mac" → "Apple", "ThinkPad" → "Lenovo")
+                if "brand" in new_filters and isinstance(new_filters["brand"], str):
+                    raw_brand = new_filters["brand"].strip()
+                    new_filters["brand"] = _BRAND_VALUE_ALIASES.get(raw_brand.lower(), raw_brand)
                 logger.info(f"Extracted filters (normalised): {new_filters}")
                 self.filters.update(new_filters)
 
@@ -877,34 +981,42 @@ class UniversalAgent:
                     break
 
         # ── Preferred brand ───────────────────────────────────────────────────
-        # Only extract if NOT negated (i.e., not in excl_brands)
-        _brand_phrases = [
-            (r'\b(?:apple|macbook|mac\s+air|mac\s+pro)\b', "Apple"),
-            (r'\bdell\b|\bxps\b|\binspiron\b|\blatitude\b', "Dell"),
-            (r'\blenovo\b|\bthinkpad\b|\bideapad\b', "Lenovo"),
-            (r'\basus\b|\brog\b', "ASUS"),
-            (r'\bmsi\b', "MSI"),
-            (r'\brazer\b', "Razer"),
-            (r'\bmicrosoft\b|\bsurface\b', "Microsoft"),
-            (r'\bsamsung\b', "Samsung"),
-            (r'\bframework\b', "Framework"),
-            (r'\bsystem76\b', "System76"),
-            (r'\bhp\b|\bhewlett\b', "HP"),
-            (r'\bacer\b|\baspire\b|\bswift\b', "Acer"),
-            (r'\bgigabyte\b|\baorus\b', "Gigabyte"),
-            (r'\btoshiba\b|\bdynabook\b', "Toshiba"),
-        ]
-        # Only set if user is NOT excluding the brand
-        for _bp, _bv in _brand_phrases:
-            if re.search(_bp, text, re.IGNORECASE) and _bv not in excl_brands:
-                # Check not in an exclusion context
-                _mctx = re.search(
-                    r'(?:no|not|avoid|hate)\s+' + re.escape(_bv.lower()),
-                    text, re.IGNORECASE
-                )
-                if not _mctx:
-                    criteria.append(SlotValue(slot_name="brand", value=_bv))
+        # Step 1: semantic LLM extraction (handles ALL natural-language variations —
+        #   "mac", "MACS", "M2 chip", "Apple Silicon", "thinkpad carbon", etc.)
+        #   This is the correct approach; regex below is a last-resort fallback only.
+        _brand_found: Optional[str] = _extract_brand_semantic(message)
+
+        # Step 2: regex fallback only if LLM unavailable (quota, network error)
+        if _brand_found is None:
+            _brand_phrases = [
+                (r'\b(?:apple|macbook|mac\s+air|mac\s+pro|mac\s+mini|mac\s+book|macs?)\b', "Apple"),
+                (r'\bdell\b|\bxps\b|\binspiron\b|\blatitude\b', "Dell"),
+                (r'\blenovo\b|\bthinkpad\b|\bideapad\b', "Lenovo"),
+                (r'\basus\b|\brog\b', "ASUS"),
+                (r'\bmsi\b', "MSI"),
+                (r'\brazer\b', "Razer"),
+                (r'\bmicrosoft\b|\bsurface\b', "Microsoft"),
+                (r'\bsamsung\b', "Samsung"),
+                (r'\bframework\b', "Framework"),
+                (r'\bsystem76\b', "System76"),
+                (r'\bhp\b|\bhewlett\b', "HP"),
+                (r'\bacer\b|\baspire\b|\bswift\b', "Acer"),
+                (r'\bgigabyte\b|\baorus\b', "Gigabyte"),
+                (r'\btoshiba\b|\bdynabook\b', "Toshiba"),
+            ]
+            for _bp, _bv in _brand_phrases:
+                if re.search(_bp, text, re.IGNORECASE):
+                    _brand_found = _bv
                     break
+
+        # Step 3: apply — skip if brand is in the exclusion list or negated in context
+        if _brand_found and _brand_found not in excl_brands:
+            _negation = re.search(
+                r'(?:no|not|avoid|hate|don.t\s+(?:want|like))\s+' + re.escape(_brand_found.lower()),
+                text, re.IGNORECASE,
+            )
+            if not _negation:
+                criteria.append(SlotValue(slot_name="brand", value=_brand_found))
 
         # ── Intent signals ────────────────────────────────────────────────────
         _impatient_kws = (
@@ -930,6 +1042,10 @@ class UniversalAgent:
             for item in criteria:
                 canonical = domain_aliases.get(item.slot_name, item.slot_name)
                 new_filters[canonical] = item.value
+            # Normalise brand value (e.g., "mac" → "Apple", "ThinkPad" → "Lenovo")
+            if "brand" in new_filters and isinstance(new_filters["brand"], str):
+                raw_brand = new_filters["brand"].strip()
+                new_filters["brand"] = _BRAND_VALUE_ALIASES.get(raw_brand.lower(), raw_brand)
             logger.info(f"Regex fallback extracted (normalised): {new_filters}")
             self.filters.update(new_filters)
         else:
