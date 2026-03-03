@@ -2072,15 +2072,22 @@ def _generate_why_picked(product: Dict[str, Any], tier: str, position: int, buck
     # The professor noted the cheapest product ($359) had no budget-friendly tag while
     # the pricier one ($369) did, because position-0 only got "Cheapest option" and the
     # budget-friendly bullet only fired as a fallback when len(bullets) < 2.
+    #
+    # "similar" tier is assigned when the full result set has < 30 % price spread
+    # (e.g. $199 vs $209).  In that case we suppress tier-specific bullets entirely —
+    # calling one product "✓ Budget-friendly" and the next "↳ Premium pick" when
+    # they're $10 apart is actively misleading.
     if tier == "budget":
         bullets.append("✓ Budget-friendly")
+    # Position context — omitted for "similar" tier (no meaningful rank within a
+    # near-uniform price band).
     if position == 0 and tier == "budget":
         bullets.append("↳ Cheapest option in this tier")
     elif position == bucket_size - 1 and tier == "premium":
         bullets.append("↳ Top-tier performance pick")
-    elif position == 0:
+    elif position == 0 and tier != "similar":
         bullets.append("↳ Best value in this tier")
-    elif position == bucket_size - 1:
+    elif position == bucket_size - 1 and tier != "similar":
         bullets.append("↳ Premium pick in this group")
 
     # Ensure at least 2 bullets — add price context as fallback (skip if already budget tier)
@@ -2202,6 +2209,18 @@ async def _search_ecommerce_products(
         bucket_labels = []
         fmt_domain = "books" if category.lower() == "books" else "laptops"
 
+        # Determine whether the result set has a meaningful price spread.
+        # "Budget-Friendly / Mid-Range / Premium" labels are only truthful when the
+        # most expensive result costs ≥30% more than the cheapest.  Below that
+        # threshold (e.g. $199 vs $209) the labels are positional lies — use neutral
+        # names instead so the UI doesn't misrepresent similarly-priced products.
+        _all_prices = [float(p.get("price", 0) or 0) for p in product_dicts if p.get("price")]
+        _min_all = min(_all_prices) if _all_prices else 0.0
+        _max_all = max(_all_prices) if _all_prices else 0.0
+        _price_spread = (_max_all / _min_all) if _min_all > 0 else 1.0
+        _SPREAD_THRESHOLD = 1.30   # 30 % gap needed before tier labels are meaningful
+        _use_tier_labels = _price_spread >= _SPREAD_THRESHOLD
+
         for i in range(n_rows):
             start = i * n_per_row          # non-overlapping stride
             bucket_products = product_dicts[start:start + n_per_row]
@@ -2209,7 +2228,13 @@ async def _search_ecommerce_products(
                 break                      # fewer products than buckets → stop early
             min_price = min(float(p.get("price", 0) or 0) for p in bucket_products)
             max_price = max(float(p.get("price", 0) or 0) for p in bucket_products)
-            tier = "budget" if i == 0 else ("premium" if i == n_rows - 1 else "mid")
+            price_range = f"${min_price:.0f}–${max_price:.0f}" if min_price != max_price else f"${min_price:.0f}"
+
+            # "similar" tier suppresses misleading tier-specific bullets in _generate_why_picked
+            if _use_tier_labels:
+                tier = "budget" if i == 0 else ("premium" if i == n_rows - 1 else "mid")
+            else:
+                tier = "similar"
 
             formatted_bucket = []
             for j, p in enumerate(bucket_products):
@@ -2220,12 +2245,21 @@ async def _search_ecommerce_products(
                 formatted_bucket.append(fp)
 
             buckets.append(formatted_bucket)
-            if i == 0:
-                bucket_labels.append(f"Budget-Friendly (${min_price:.0f}-${max_price:.0f})")
-            elif i == n_rows - 1:
-                bucket_labels.append(f"Premium (${min_price:.0f}-${max_price:.0f})")
+            if _use_tier_labels:
+                if i == 0:
+                    bucket_labels.append(f"Budget-Friendly ({price_range})")
+                elif i == n_rows - 1:
+                    bucket_labels.append(f"Premium ({price_range})")
+                else:
+                    bucket_labels.append(f"Mid-Range ({price_range})")
             else:
-                bucket_labels.append(f"Mid-Range (${min_price:.0f}-${max_price:.0f})")
+                # Neutral positional labels — convey rank without implying price tier
+                if i == 0:
+                    bucket_labels.append(f"Value Pick ({price_range})")
+                elif i == n_rows - 1:
+                    bucket_labels.append(f"Performance Pick ({price_range})")
+                else:
+                    bucket_labels.append(f"Balanced Pick ({price_range})")
 
         return buckets, bucket_labels
 
