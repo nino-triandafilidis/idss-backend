@@ -1344,6 +1344,18 @@ async def search_products(
                     Product.attributes['description'].astext.ilike("%thinkpad%")  # ThinkPad is a laptop
                 )
             )
+            # Exclude Chromebooks from general laptop queries unless the user explicitly asked for one.
+            # Chromebooks run ChromeOS and are a fundamentally different product category from
+            # Windows/Mac laptops.  Showing a $64 Chromebook as the "best Dell laptop" misleads users.
+            _chromebook_requested = any(
+                kw in (search_query or "").lower()
+                for kw in ["chromebook", "chrome book", "chromeos", "chrome os"]
+            )
+            if not _chromebook_requested:
+                db_query = db_query.filter(
+                    ~Product.name.ilike("%chromebook%"),
+                    ~Product.name.ilike("%chrome book%"),
+                )
         elif product_type_hint == "desktop":
             # Try strict desktop filter first; if 0 results, relax (don't filter by ptype) so we return category matches
             strict_desktop = db_query.filter(
@@ -1641,7 +1653,18 @@ async def search_products(
                 db_query = db_query.filter((Product.price_value * 100) <= price_max_cents * 2)
             else:
                 db_query = db_query.filter((Product.price_value * 100) <= price_max_cents)
-    
+
+        # Laptop price floor: exclude sub-$150 items when no explicit min-price was set.
+        # A $64 "laptop" is invariably heavily damaged, mislabeled, or a decade-old machine —
+        # it should never appear as a recommendation.  Only apply when user hasn't specified a
+        # budget floor themselves (e.g. "show me the cheapest laptop" with a $50 budget).
+        if (
+            filters.get("_product_type_hint") == "laptop"
+            and "price_min_cents" not in filters
+            and "price_min" not in filters
+        ):
+            db_query = db_query.filter(Product.price_value >= 150)
+
     # ── Hardware spec filters from query_parser (attributes JSON column) ──
     # These handle Reddit-style complex queries like "16GB RAM, 512GB SSD, 15.6-inch"
     # Filters are soft: products without attributes are still included (OR attributes IS NULL)
