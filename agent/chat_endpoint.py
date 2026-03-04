@@ -127,6 +127,101 @@ async def _is_prompt_injection(message: str) -> bool:
 
 
 # ============================================================================
+# Popular-question cache — instant answers for frequently asked questions
+# Keys are lowercase canonical forms; values are (message, quick_replies) tuples.
+# Lookup uses _normalize_for_cache() so minor wording variations match.
+# ============================================================================
+
+_POPULAR_QA: dict[str, tuple[str, list[str]]] = {
+    "what is ram": (
+        "**RAM** (Random Access Memory) is your laptop's short-term memory — it holds the data "
+        "your CPU is actively using. More RAM means you can run more programs at once without "
+        "slowdowns. 8 GB is the baseline today; 16 GB is comfortable for most users; 32 GB+ is "
+        "for power users running VMs, video editing, or large ML models.",
+        ["Show laptops with 16GB RAM", "Show laptops with 32GB RAM", "What is a good laptop for me?"],
+    ),
+    "what is ssd": (
+        "An **SSD** (Solid-State Drive) stores your files and OS. Unlike older spinning hard drives "
+        "(HDDs), SSDs have no moving parts — so they're much faster (5–10× boot speed), quieter, "
+        "and more durable. For everyday use, 256 GB SSD is the minimum; 512 GB is comfortable; "
+        "1 TB is ideal for media or game libraries.",
+        ["Show laptops with 512GB SSD", "What is the difference between SSD and HDD?"],
+    ),
+    "what is the difference between ssd and hdd": (
+        "**SSD vs HDD:**\n"
+        "- **Speed**: SSDs are 5–10× faster for boot times and file access.\n"
+        "- **Durability**: SSDs have no moving parts — more resistant to drops.\n"
+        "- **Noise**: SSDs are completely silent; HDDs hum.\n"
+        "- **Price**: SSDs cost more per GB, but prices have dropped significantly.\n"
+        "- **Verdict**: Get an SSD for any primary drive. HDDs are fine for large external storage.",
+        ["Show laptops with SSD", "What storage size do I need?"],
+    ),
+    "what is a gpu": (
+        "A **GPU** (Graphics Processing Unit) handles graphics rendering and parallel computation. "
+        "For gaming, a dedicated GPU (like NVIDIA RTX or AMD Radeon) is essential. For ML/AI work, "
+        "an NVIDIA GPU with CUDA support accelerates training. For general use — browsing, documents, "
+        "video calls — integrated graphics (Intel Iris, AMD Radeon Graphics) is sufficient.",
+        ["Show gaming laptops", "Show laptops with dedicated GPU", "Show ML laptops"],
+    ),
+    "how many questions will you ask": (
+        "I typically ask **2–3 quick questions** to understand your needs — things like budget, "
+        "primary use case, and any brand preferences. You can skip questions anytime by saying "
+        "'just show me laptops' and I'll use smart defaults.",
+        ["Show me laptops now", "I need a laptop for gaming", "I need a budget laptop"],
+    ),
+    "what can you do": (
+        "I can help you:\n"
+        "- **Find laptops, books, and vehicles** tailored to your needs\n"
+        "- **Compare products** side-by-side on specs, price, and ratings\n"
+        "- **Answer questions** about specific products or technical specs\n"
+        "- **Add items to cart** and manage your favorites\n\n"
+        "Just describe what you're looking for in plain English!",
+        ["Find me a laptop", "Show books", "Compare two laptops"],
+    ),
+    "what laptops do you have": (
+        "Our catalog includes **1,490+ laptops** from 222+ brands — including Apple, Dell, HP, "
+        "Lenovo, ASUS, Acer, MSI, Razer, Framework, and more. Prices range from ~$200 budget "
+        "picks to $4,000+ workstations. Tell me your budget and use case to get the best matches!",
+        ["Find me a laptop under $800", "Show gaming laptops", "Show thin and light laptops"],
+    ),
+    "hi": (
+        "Hi! I'm your AI shopping assistant from Stanford's LDR Lab. I can help you find the "
+        "perfect laptop, book, or vehicle. What are you looking for today?",
+        ["Laptops", "Books", "Vehicles", "I'm not sure yet"],
+    ),
+    "hello": (
+        "Hello! I'm your AI shopping assistant. Tell me what you're looking for and I'll find "
+        "the best options for you — just describe your needs in plain English!",
+        ["Find me a laptop", "I need a book", "Show me cars"],
+    ),
+    "help": (
+        "I'm here to help you find the right product! Here's what you can do:\n"
+        "- Type what you're looking for (e.g. 'gaming laptop under $1000')\n"
+        "- Ask me to compare products\n"
+        "- Ask technical questions about specs\n"
+        "- Use the action buttons below recommendations to refine results",
+        ["Find me a laptop", "What laptops do you have?", "What can you do?"],
+    ),
+}
+
+# Normalisation: lowercase, strip punctuation, collapse whitespace
+_CACHE_STRIP_RE = re.compile(r"[^a-z0-9\s]")
+_CACHE_FILLER_RE = re.compile(r"\b(please|can you|could you|tell me|explain|what's|whats|i want to know)\b")
+
+
+def _normalize_for_cache(text: str) -> str:
+    t = text.lower().strip()
+    t = _CACHE_STRIP_RE.sub("", t)
+    t = _CACHE_FILLER_RE.sub("", t)
+    return " ".join(t.split())
+
+
+# Pre-normalize all _POPULAR_QA keys so lookups always match regardless of filler
+# words in either the query or the stored key.
+_POPULAR_QA = {_normalize_for_cache(k): v for k, v in _POPULAR_QA.items()}
+
+
+# ============================================================================
 # Request/Response Models (compatible with IDSS)
 # ============================================================================
 
@@ -372,20 +467,140 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
 # Best-Value Scoring
 # ============================================================================
 
-def _pick_best_value(products: list) -> Optional[dict]:
-    """
-    Score each product by a weighted value formula and return the single best.
+# Maps user-supplied use_case variants to canonical weight-profile keys.
+_USE_CASE_ALIASES: dict = {
+    "machine learning": "ml", "data science": "ml", "deep learning": "ml",
+    "ai": "ml", "artificial intelligence": "ml", "data": "ml",
+    "game": "gaming", "games": "gaming", "gamer": "gaming",
+    "video game": "gaming", "video games": "gaming", "play games": "gaming",
+    "code": "programming", "coding": "programming", "developer": "programming",
+    "development": "programming", "software": "programming",
+    "school": "student", "college": "student", "university": "student",
+    "study": "student", "homework": "student", "education": "student",
+    "video": "video editing", "editing": "video editing",
+    "content creation": "video editing", "creator": "video editing",
+    "photo editing": "video editing", "design": "video editing",
+}
 
-    Weights:
-      35% price      — lower is better (normalized within the set)
-      35% rating     — higher is better (0-5 → 0-1)
-      10% review vol — more reviews = more trustworthy rating (capped at 0.10)
-      20% specs      — RAM tier bonus for laptops; mileage bonus for vehicles
+_USE_CASE_WEIGHTS: dict = {
+    "gaming":        {"price": 0.15, "rating": 0.20, "review_vol": 0.05, "spec": 0.60},
+    "ml":            {"price": 0.15, "rating": 0.20, "review_vol": 0.05, "spec": 0.60},
+    "programming":   {"price": 0.20, "rating": 0.30, "review_vol": 0.05, "spec": 0.45},
+    "student":       {"price": 0.45, "rating": 0.30, "review_vol": 0.05, "spec": 0.20},
+    "video editing": {"price": 0.15, "rating": 0.20, "review_vol": 0.05, "spec": 0.60},
+    "default":       {"price": 0.35, "rating": 0.35, "review_vol": 0.10, "spec": 0.20},
+}
+
+
+def _spec_score_for_use_case(product: dict, use_case: str) -> float:
+    """Return a 0–1 spec score tuned to the use_case.
+
+    Handles three product layouts:
+      - Flat (vehicle/MCP): product["gpu"], product["ram_gb"], …
+      - Nested laptop: product["laptop"]["specs"]["graphics" | "ram" | …]
+      - KG attributes: product["attributes"]["gpu" | "ram_gb" | …]
+    """
+    attrs = product.get("attributes") or {}
+    laptop_specs: dict = {}
+    _lp = product.get("laptop")
+    if isinstance(_lp, dict):
+        laptop_specs = _lp.get("specs") or {}
+
+    def _int(v: object) -> int:
+        try:
+            s = str(v or "").strip().lower().split()[0].replace("gb", "").replace("g", "")
+            return int(float(s))
+        except (TypeError, ValueError, IndexError):
+            return 0
+
+    # RAM — check laptop_specs first, then attrs, then top-level
+    _ram_raw = (
+        laptop_specs.get("ram")
+        or attrs.get("ram_gb")
+        or attrs.get("ram")
+        or product.get("ram_gb")
+        or product.get("ram")
+        or 0
+    )
+    ram_gb = _int(_ram_raw)
+
+    # GPU — check all paths
+    gpu = (
+        laptop_specs.get("graphics")
+        or product.get("gpu_model")
+        or product.get("gpu")
+        or attrs.get("gpu")
+        or ""
+    ).lower()
+
+    # Refresh rate
+    refresh = _int(
+        laptop_specs.get("refresh_rate")
+        or attrs.get("refresh_rate")
+        or attrs.get("refresh_rate_hz")
+        or product.get("refresh_rate")
+        or 60
+    )
+
+    # Battery
+    _batt_raw = (
+        laptop_specs.get("battery_life")
+        or product.get("battery_life")
+        or attrs.get("battery_life")
+        or 0
+    )
+    battery = _int(_batt_raw)
+    score = 0.0
+
+    if use_case == "gaming":
+        if any(k in gpu for k in ("rtx 4090", "rtx 4080", "rx 7900")):   score += 0.40
+        elif any(k in gpu for k in ("rtx 4070", "rtx 3080", "rx 6800")): score += 0.30
+        elif any(k in gpu for k in ("rtx 4060", "rtx 3070", "rx 6700")): score += 0.20
+        elif any(k in gpu for k in ("rtx", "gtx", "rx ", "arc")):         score += 0.10
+        if refresh >= 165:   score += 0.15
+        elif refresh >= 144: score += 0.10
+        elif refresh >= 120: score += 0.05
+        score += 0.05 if ram_gb >= 32 else (0.03 if ram_gb >= 16 else 0)
+
+    elif use_case == "ml":
+        if ram_gb >= 64:  score += 0.40
+        elif ram_gb >= 32: score += 0.30
+        elif ram_gb >= 16: score += 0.15
+        if any(k in gpu for k in ("rtx 4090", "rtx 4080", "rtx 3090")): score += 0.20
+        elif any(k in gpu for k in ("rtx", "arc")):                       score += 0.10
+
+    elif use_case == "video editing":
+        if any(k in gpu for k in ("rtx 4090", "rtx 4080", "rx 7900")):   score += 0.30
+        elif any(k in gpu for k in ("rtx 4070", "rtx 3080", "rx 6800")): score += 0.22
+        elif any(k in gpu for k in ("rtx", "gtx", "rx ", "arc")):         score += 0.12
+        score += 0.20 if ram_gb >= 32 else (0.12 if ram_gb >= 16 else 0)
+
+    elif use_case == "student":
+        if battery >= 12:  score += 0.30
+        elif battery >= 8: score += 0.18
+        score += 0.15 if ram_gb >= 16 else (0.08 if ram_gb >= 8 else 0)
+
+    else:  # programming / default
+        score += 0.20 if ram_gb >= 32 else (0.12 if ram_gb >= 16 else (0.06 if ram_gb >= 8 else 0))
+
+    return min(score, 1.0)
+
+
+def _pick_best_value(products: list, use_case: str = "") -> Optional[dict]:
+    """
+    Score each product and return the single best.
+
+    Weights are tuned per use_case (gaming → spec-heavy; student → price-heavy).
+    Falls back to balanced default when use_case is absent or unknown.
     """
     if not products:
         return None
     if len(products) == 1:
         return products[0]
+
+    # Resolve use_case alias ("machine learning" → "ml", etc.)
+    _uc = _USE_CASE_ALIASES.get(use_case.lower().strip(), use_case.lower().strip())
+    weights = _USE_CASE_WEIGHTS.get(_uc, _USE_CASE_WEIGHTS["default"])
 
     prices = []
     for p in products:
@@ -402,41 +617,31 @@ def _pick_best_value(products: list) -> Optional[dict]:
 
     scored = []
     for product, price in zip(products, prices):
-        # --- Price score (lower → better) ---
+        # Price score (lower → better)
         price_score = 1.0 - (price - min_price) / price_range if max_price > 0 else 0.5
 
-        # --- Rating score ---
+        # Rating score
         try:
             rating = float(product.get("rating") or 0)
         except (TypeError, ValueError):
             rating = 0.0
         rating_score = rating / 5.0
 
-        # --- Review volume (confidence boost, max 0.10) ---
+        # Review volume confidence boost (capped at weight cap)
         try:
             reviews = int(product.get("reviews_count") or 0)
         except (TypeError, ValueError):
             reviews = 0
-        review_boost = min(reviews / 200.0, 0.10)
+        review_boost = min(reviews / 200.0, weights["review_vol"])
 
-        # --- Spec bonus (laptops: RAM tier) ---
-        spec_score = 0.0
-        attrs = product.get("attributes") or {}
+        # Use-case-tuned spec score
+        spec_score = _spec_score_for_use_case(product, _uc)
+
+        # Vehicles: penalise high mileage (domain-specific adjustment)
         try:
-            ram_gb = int(attrs.get("ram_gb") or 0)
-            if ram_gb >= 32:
-                spec_score += 0.20
-            elif ram_gb >= 16:
-                spec_score += 0.12
-            elif ram_gb >= 8:
-                spec_score += 0.06
-        except (TypeError, ValueError):
-            pass
-        # Vehicles: penalise high mileage
-        try:
-            mileage = int(product.get("mileage") or product.get("vehicle", {}).get("mileage") or 0)
+            mileage = int(product.get("mileage") or (product.get("vehicle") or {}).get("mileage") or 0)
             if mileage and max_price > 0:
-                spec_score -= min(mileage / 200_000, 0.15)
+                spec_score = max(0.0, spec_score - min(mileage / 200_000, 0.15))
         except (TypeError, ValueError):
             pass
 
@@ -444,10 +649,12 @@ def _pick_best_value(products: list) -> Optional[dict]:
             # No rating data: lean on price + specs
             total = price_score * 0.60 + spec_score * 0.30 + review_boost
         else:
-            total = (price_score * 0.35) + (rating_score * 0.35) + review_boost + (spec_score * 0.20)
+            total = (price_score * weights["price"]
+                     + rating_score * weights["rating"]
+                     + review_boost
+                     + spec_score * weights["spec"])
 
-        # Chromebooks are a different product category (ChromeOS, cloud-only).
-        # Penalise them heavily so they never win "Best Pick" in a general laptop search.
+        # Chromebook penalty — never wins Best Pick in a general laptop search
         _pname = (product.get("name") or "").lower()
         if "chromebook" in _pname or "chrome book" in _pname:
             total = max(0.0, total - 0.35)
@@ -644,6 +851,24 @@ async def _handle_post_recommendation(
     msg_lower = clean_message.lower()
 
     # -----------------------------------------------------------------------
+    # Popular-question cache — instant answers, no LLM call needed
+    # -----------------------------------------------------------------------
+    _cache_key = _normalize_for_cache(clean_message)
+    if _cache_key in _POPULAR_QA:
+        _cached_msg, _cached_replies = _POPULAR_QA[_cache_key]
+        logger.info("popular_question_cache_hit", f"Cache hit for: {_cache_key[:60]}", {"session_id": session_id})
+        return ChatResponse(
+            response_type="question",
+            message=_cached_msg,
+            session_id=session_id,
+            quick_replies=_cached_replies,
+            filters={},
+            preferences={},
+            question_count=session.question_count,
+            domain=active_domain,
+        )
+
+    # -----------------------------------------------------------------------
     # Fast intent router: compare vs. refine vs. other
     # -----------------------------------------------------------------------
     # Keyword fast-path skips the LLM call for obvious fixed-button messages
@@ -735,7 +960,7 @@ async def _handle_post_recommendation(
                 _deduped_bv.append(_p)
         products = _deduped_bv
 
-        best = _pick_best_value(products)
+        best = _pick_best_value(products, use_case=session.agent_filters.get("use_case", ""))
         if best:
             explanation = _explain_best_value(best, active_domain or "laptops", products)
             from app.formatters import format_product
@@ -1684,7 +1909,7 @@ async def _search_and_respond_vehicles(
         # ------------------------------------------------------------------
         vehicle_labels = list(result.bucket_labels) if result.bucket_labels else []
         try:
-            best_v = _pick_best_value(flat_data)
+            best_v = _pick_best_value(flat_data, use_case=search_filters.get("use_case", ""))
             if best_v:
                 best_v_id = best_v.get("id")
                 explanation_v = _explain_best_value(best_v, "vehicles", flat_data)
@@ -1810,7 +2035,7 @@ async def _search_and_respond_ecommerce(
     # and move it to recs[0][0] so the frontend hero renders it first.
     # ------------------------------------------------------------------
     try:
-        best = _pick_best_value(flat_data)
+        best = _pick_best_value(flat_data, use_case=search_filters.get("use_case", ""))
         if best:
             best_id = best.get("product_id") or best.get("id")
             explanation = _explain_best_value(best, domain, flat_data)
@@ -1846,12 +2071,7 @@ async def _search_and_respond_ecommerce(
         filters=search_filters,
         preferences=search_filters.get("_soft_preferences", {}),
         question_count=question_count,
-        quick_replies=[
-            "See similar items",
-            "Research",
-            "Compare items",
-            "Rate recommendations",
-        ],
+        quick_replies=_recommendation_quick_replies(flat_data, search_filters),
         timings_ms=timings
     )
 
@@ -1859,6 +2079,85 @@ async def _search_and_respond_ecommerce(
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+
+def _recommendation_quick_replies(products: List[Dict], search_filters: Dict) -> List[str]:
+    """Generate context-aware follow-up chips based on what was just returned."""
+    replies: List[str] = []
+
+    use_case = (search_filters.get("use_case") or "").lower().strip()
+    brand = search_filters.get("brand") or search_filters.get("preferred_brand") or ""
+    budget_cents = search_filters.get("price_max_cents") or search_filters.get("budget_cents")
+
+    # Derive representative price from results
+    prices = [float(p.get("price") or 0) for p in products if p.get("price")]
+    avg_price = sum(prices) / len(prices) if prices else 0
+    max_price = max(prices) if prices else 0
+    min_price = min(prices) if prices else 0
+
+    # --- Use-case specific chips ---
+    if use_case in ("gaming", "game"):
+        if budget_cents:
+            budget_dollars = budget_cents // 100
+            lower = max(300, budget_dollars - 200)
+            replies.append(f"Show gaming laptops under ${lower:,}")
+        replies.append("Compare GPU performance across these")
+        replies.append("Show laptops with RTX 4070 or better")
+
+    elif use_case in ("ml", "machine learning", "data science", "ai"):
+        replies.append("Show laptops with 32GB+ RAM")
+        replies.append("Compare GPU options for ML workloads")
+        if max_price > 0:
+            replies.append(f"Find similar laptops under ${int(min_price + 200):,}")
+
+    elif use_case in ("student", "school", "college"):
+        replies.append("Show lightest options under 4 lbs")
+        replies.append("Which has the best battery life?")
+        if avg_price > 700:
+            replies.append("Show me budget-friendly alternatives under $700")
+
+    elif use_case in ("video editing", "creative", "design"):
+        replies.append("Show laptops with OLED or 4K display")
+        replies.append("Compare color accuracy across these")
+
+    elif use_case in ("programming", "coding", "developer", "work"):
+        replies.append("Show laptops with the best keyboard")
+        replies.append("Which has the longest battery?")
+
+    # --- Budget-based chips (always relevant) ---
+    if budget_cents and avg_price > 0:
+        budget_dollars = budget_cents // 100
+        if avg_price < budget_dollars * 0.75:
+            # Results are well under budget — offer to go premium
+            premium_ceil = int(budget_dollars * 1.30)
+            replies.append(f"Show me more powerful options up to ${premium_ceil:,}")
+        elif avg_price > budget_dollars * 0.90:
+            # Results near budget ceiling — offer cheaper
+            cheaper_ceil = max(300, budget_dollars - 150)
+            replies.append(f"Find something under ${cheaper_ceil:,}")
+
+    # --- Brand chips ---
+    if brand and len(brand) < 20:
+        replies.append(f"Show other {brand} models")
+        if not any("brand" in r.lower() for r in replies):
+            replies.append("Show top-rated alternatives from other brands")
+
+    # --- Universal fallbacks (only fill remaining slots) ---
+    universal = [
+        "Tell me more about these products",
+        "Which has the best value for money?",
+        "Compare top two side by side",
+        "Show me something lighter",
+        "Refine my search",
+    ]
+    for u in universal:
+        if len(replies) >= 4:
+            break
+        if u not in replies:
+            replies.append(u)
+
+    return replies[:5]
+
 
 def _domain_to_category(active_domain: Optional[str]) -> str:
     """Map domain to database category for e-commerce search."""

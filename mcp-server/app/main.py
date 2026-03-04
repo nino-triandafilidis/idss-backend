@@ -18,6 +18,8 @@ import os
 import sys
 import time as _time
 import json as _json
+import uuid as _uuid
+from datetime import datetime as _datetime
 from dotenv import load_dotenv
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -338,6 +340,44 @@ async def chat(request: ChatRequest):
     - n_per_row: Items per row
     """
     return await process_chat(request)
+
+
+# ─── Shareable chat link store ───────────────────────────────────────────────
+# In-memory dict: share_id (8-char hex) → {title, messages, created_at}
+# Persists for the lifetime of the server process.
+_SHARED_CHATS: Dict[str, Dict[str, Any]] = {}
+
+
+class ShareRequest(BaseModel):
+    messages: List[Dict[str, Any]]
+    title: str = ""
+    session_id: str = ""
+
+
+class ShareResponse(BaseModel):
+    share_id: str
+
+
+@app.post("/share", response_model=ShareResponse)
+async def create_share(request: ShareRequest):
+    """Store a chat snapshot and return a short share_id."""
+    share_id = _uuid.uuid4().hex[:8]
+    _SHARED_CHATS[share_id] = {
+        "title": request.title or "IDSS Chat",
+        "messages": request.messages,
+        "session_id": request.session_id,
+        "created_at": _datetime.utcnow().isoformat() + "Z",
+    }
+    return ShareResponse(share_id=share_id)
+
+
+@app.get("/share/{share_id}")
+async def get_share(share_id: str):
+    """Retrieve a stored chat snapshot by share_id."""
+    share = _SHARED_CHATS.get(share_id)
+    if not share:
+        raise HTTPException(status_code=404, detail="Shared chat not found")
+    return share
 
 
 @app.get("/session/{session_id}", response_model=SessionResponse)
