@@ -9,6 +9,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import text as _sa_text
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 import uvicorn
@@ -122,6 +123,23 @@ async def lifespan(app: FastAPI):
             "Tables should already exist (Supabase / remote DB).",
             _e,
         )
+
+    # Ensure shared_chats table exists (created via raw SQL so no ORM model needed)
+    try:
+        with engine.connect() as _conn:
+            _conn.execute(_sa_text("""
+                CREATE TABLE IF NOT EXISTS shared_chats (
+                    share_id VARCHAR(8) PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    messages JSONB NOT NULL DEFAULT '[]',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """))
+            _conn.commit()
+        logger.info("shared_chats table ready")
+    except Exception as _e:
+        logger.warning("Could not create shared_chats table: %s", _e)
 
     skip_preload = os.getenv("MCP_SKIP_PRELOAD", "0") == "1"
     if skip_preload:
@@ -343,9 +361,7 @@ async def chat(request: ChatRequest):
 
 
 # ─── Shareable chat link store ───────────────────────────────────────────────
-# In-memory dict: share_id (8-char hex) → {title, messages, created_at}
-# Persists for the lifetime of the server process.
-_SHARED_CHATS: Dict[str, Dict[str, Any]] = {}
+# Persisted to PostgreSQL shared_chats table (created in lifespan startup).
 
 
 class ShareRequest(BaseModel):
@@ -359,25 +375,40 @@ class ShareResponse(BaseModel):
 
 
 @app.post("/share", response_model=ShareResponse)
-async def create_share(request: ShareRequest):
-    """Store a chat snapshot and return a short share_id."""
+async def create_share(request: ShareRequest, db: Session = Depends(get_db)):
+    """Store a chat snapshot in the DB and return a short share_id."""
     share_id = _uuid.uuid4().hex[:8]
-    _SHARED_CHATS[share_id] = {
-        "title": request.title or "IDSS Chat",
-        "messages": request.messages,
-        "session_id": request.session_id,
-        "created_at": _datetime.utcnow().isoformat() + "Z",
-    }
+    db.execute(
+        _sa_text(
+            "INSERT INTO shared_chats (share_id, title, messages, session_id)"
+            " VALUES (:sid, :title, :messages::jsonb, :session_id)"
+        ),
+        {
+            "sid": share_id,
+            "title": request.title or "IDSS Chat",
+            "messages": _json.dumps(request.messages),
+            "session_id": request.session_id,
+        },
+    )
+    db.commit()
     return ShareResponse(share_id=share_id)
 
 
 @app.get("/share/{share_id}")
-async def get_share(share_id: str):
+async def get_share(share_id: str, db: Session = Depends(get_db)):
     """Retrieve a stored chat snapshot by share_id."""
-    share = _SHARED_CHATS.get(share_id)
-    if not share:
+    row = db.execute(
+        _sa_text(
+            "SELECT title, messages, created_at FROM shared_chats WHERE share_id = :sid"
+        ),
+        {"sid": share_id},
+    ).fetchone()
+    if not row:
         raise HTTPException(status_code=404, detail="Shared chat not found")
-    return share
+    created_iso = row.created_at.isoformat()
+    if not created_iso.endswith("Z"):
+        created_iso = created_iso.replace("+00:00", "") + "Z"
+    return {"title": row.title, "messages": row.messages, "created_at": created_iso}
 
 
 @app.get("/session/{session_id}", response_model=SessionResponse)
