@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text as _sa_text
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
+import asyncio
 import uvicorn
 import logging
 import traceback
@@ -381,7 +382,7 @@ async def create_share(request: ShareRequest, db: Session = Depends(get_db)):
     db.execute(
         _sa_text(
             "INSERT INTO shared_chats (share_id, title, messages, session_id)"
-            " VALUES (:sid, :title, :messages::jsonb, :session_id)"
+            " VALUES (:sid, :title, CAST(:messages AS jsonb), :session_id)"
         ),
         {
             "sid": share_id,
@@ -409,6 +410,108 @@ async def get_share(share_id: str, db: Session = Depends(get_db)):
     if not created_iso.endswith("Z"):
         created_iso = created_iso.replace("+00:00", "") + "Z"
     return {"title": row.title, "messages": row.messages, "created_at": created_iso}
+
+
+# ─── Product Q&A — dedicated single-product question answering ───────────────
+
+
+class ProductQARequest(BaseModel):
+    question: str
+    product_context: Dict[str, Any]   # full product object from the frontend
+    history: List[Dict[str, str]] = []  # prior panel turns [{"role":…,"content":…}]
+
+
+class ProductQAResponse(BaseModel):
+    answer: str
+
+
+def _format_product_context(pc: Dict[str, Any]) -> str:
+    """Flatten a product dict into a readable context string for the LLM."""
+    name = pc.get("name") or pc.get("title") or "Product"
+    brand = pc.get("brand") or ""
+    price = pc.get("price")
+    desc = pc.get("description") or pc.get("short_description") or ""
+
+    # Collect specs from all three possible layouts
+    attrs: Dict[str, Any] = pc.get("attributes") or {}
+    lp = pc.get("laptop")
+    specs: Dict[str, Any] = (lp.get("specs") or {}) if isinstance(lp, dict) else {}
+    merged = {**attrs, **{k: v for k, v in specs.items() if v is not None}}
+
+    priority_keys = [
+        "ram", "graphics", "processor", "storage", "display",
+        "battery_life", "weight", "os", "screen_size", "refresh_rate", "resolution",
+    ]
+    lines = [f"Product: {name}"]
+    if brand:
+        lines.append(f"Brand: {brand}")
+    if price is not None:
+        price_str = f"${float(price):,.0f}" if isinstance(price, (int, float)) else str(price)
+        lines.append(f"Price: {price_str}")
+
+    lines.append("Specifications:")
+    shown: set[str] = set()
+    for k in priority_keys:
+        v = merged.get(k)
+        if v is not None:
+            lines.append(f"  {k.replace('_', ' ').title()}: {v}")
+            shown.add(k)
+    for k, v in merged.items():
+        if k not in shown and v is not None:
+            lines.append(f"  {k.replace('_', ' ').title()}: {v}")
+
+    if desc:
+        lines.append(f"Description: {desc[:600]}")
+
+    reviews = pc.get("reviews") or pc.get("review_summary") or ""
+    if reviews:
+        lines.append(f"Customer Reviews: {str(reviews)[:500]}")
+
+    rating = pc.get("rating") or pc.get("average_rating")
+    review_count = pc.get("review_count") or pc.get("num_reviews")
+    if rating:
+        line = f"Rating: {rating}/5"
+        if review_count:
+            line += f" ({review_count} reviews)"
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+@app.post("/product-qa", response_model=ProductQAResponse)
+async def product_qa(request: ProductQARequest):
+    """Answer a question about a specific product using its data as LLM context."""
+    product_text = _format_product_context(request.product_context)
+
+    system_prompt = (
+        "You are a knowledgeable product expert. The user is asking about the product below. "
+        "Answer concisely (2–4 sentences) and accurately. "
+        "If the data doesn't contain a direct answer, give your best general-knowledge response "
+        "and clearly note it. Never say 'Based on the data provided' — just answer naturally.\n\n"
+        f"PRODUCT DATA:\n{product_text}"
+    )
+
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    for msg in request.history[-6:]:   # last 3 turns for context
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": request.question})
+
+    try:
+        from openai import OpenAI as _OpenAI
+        client = _OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o-mini",
+            messages=messages,   # type: ignore[arg-type]
+            max_tokens=350,
+            temperature=0.3,
+        )
+        answer = resp.choices[0].message.content or "I couldn't generate a response."
+    except Exception as exc:
+        logger.error("product_qa_failed %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to generate answer")
+
+    return ProductQAResponse(answer=answer)
 
 
 @app.get("/session/{session_id}", response_model=SessionResponse)
