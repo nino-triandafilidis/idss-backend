@@ -497,7 +497,12 @@ class UniversalAgent:
         # Ask a clarifying question rather than silently routing to the main domain.
         msg_words = set(re.sub(r"[^a-z0-9 ]", " ", message.lower()).split())
         accessory_hit = msg_words & self._ACCESSORY_KEYWORDS
-        if accessory_hit and self.question_count == 0:
+        spec_hit = msg_words & self._SPEC_SIGNALS
+        # Only ask the accessory clarification if:
+        # - an accessory keyword is present
+        # - no spec-signal words are present (spec signals = clearly about the product itself)
+        # - message is short (long messages = detailed spec queries, not accessory requests)
+        if accessory_hit and self.question_count == 0 and not spec_hit and len(msg_words) < 20:
             domain_label = {
                 "laptops": "laptop", "vehicles": "vehicle", "books": "book"
             }.get(self.domain, self.domain)
@@ -622,9 +627,22 @@ class UniversalAgent:
     # user may mean a peripheral/accessory rather than the main product.
     _ACCESSORY_KEYWORDS: frozenset = frozenset({
         "bag", "sleeve", "stand", "dock", "docking", "charger", "adapter",
-        "cable", "mouse", "keyboard", "webcam", "monitor", "display",
+        "cable", "mouse", "webcam", "monitor",
         "upgrade", "parts", "peripheral", "accessories", "case", "cover",
-        "hub", "port", "hdmi", "usb", "ssd upgrade", "ram upgrade",
+        "hub", "port", "hdmi", "usb",
+        # Removed: "display", "keyboard" — these almost always describe desired
+        # laptop features ("16-inch display", "ThinkPad-style keyboard"), not peripherals.
+        # Removed: "ssd upgrade", "ram upgrade" — multi-word, won't match word set.
+    })
+
+    # If ANY of these spec-signal words appear the message is clearly about the
+    # product itself (not an accessory), so skip the ambiguity check.
+    _SPEC_SIGNALS: frozenset = frozenset({
+        "ram", "gb", "tb", "ssd", "nvme", "cpu", "gpu", "processor",
+        "battery", "storage", "performance", "budget", "price",
+        "gaming", "coding", "development", "programming", "editing",
+        "figma", "premiere", "docker", "pytorch", "tensorflow",
+        "under", "laptop", "notebook", "chromebook",
     })
 
     def _detect_domain_from_message(self, message: str) -> Optional[str]:
