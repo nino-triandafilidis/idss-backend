@@ -768,6 +768,7 @@ async def get_share(share_id: str, db: Session = Depends(get_db)):
 class ProductQARequest(BaseModel):
     question: str
     product_context: Dict[str, Any]   # full product object from the frontend
+    product_id: Optional[str] = None  # if provided, backend fetches full DB record to enrich context
     history: List[Dict[str, str]] = []  # prior panel turns [{"role":…,"content":…}]
 
 
@@ -782,11 +783,16 @@ def _format_product_context(pc: Dict[str, Any]) -> str:
     price = pc.get("price")
     desc = pc.get("description") or pc.get("short_description") or ""
 
-    # Collect specs from all three possible layouts
+    # Collect specs from all possible layouts:
+    #   pc["attributes"]         — top-level attributes blob
+    #   pc["laptop"]["attributes"] — full JSONB attributes blob (richest source)
+    #   pc["laptop"]["specs"]    — normalized spec fields
     attrs: Dict[str, Any] = pc.get("attributes") or {}
     lp = pc.get("laptop")
+    laptop_attrs: Dict[str, Any] = (lp.get("attributes") or {}) if isinstance(lp, dict) else {}
     specs: Dict[str, Any] = (lp.get("specs") or {}) if isinstance(lp, dict) else {}
-    merged = {**attrs, **{k: v for k, v in specs.items() if v is not None}}
+    # Merge order: laptop_attrs < top-level attrs < normalized specs (most specific wins)
+    merged = {**laptop_attrs, **attrs, **{k: v for k, v in specs.items() if v is not None}}
 
     priority_keys = [
         "ram", "graphics", "processor", "storage", "display",
@@ -830,8 +836,29 @@ def _format_product_context(pc: Dict[str, Any]) -> str:
 
 @app.post("/product-qa", response_model=ProductQAResponse)
 async def product_qa(request: ProductQARequest):
-    """Answer a question about a specific product using its data as LLM context."""
-    product_text = _format_product_context(request.product_context)
+    """Answer a question about a specific product using its data as LLM context.
+
+    If product_id is supplied the backend fetches the full DB record and merges
+    it with product_context so the LLM always has complete spec data.
+    """
+    context = dict(request.product_context)
+
+    # Enrich with full DB record when product_id is available
+    if request.product_id:
+        try:
+            from app.tools.supabase_product_store import get_product_store
+            store = get_product_store()
+            db_products = await asyncio.to_thread(
+                store.get_by_ids, [request.product_id]
+            )
+            if db_products:
+                db_rec = db_products[0] if isinstance(db_products[0], dict) else vars(db_products[0])
+                # DB record enriches context; frontend values (rating, reviews) take precedence
+                context = {**db_rec, **context}
+        except Exception as _enrich_err:
+            logger.warning("product_qa_enrich_failed %s", _enrich_err)
+
+    product_text = _format_product_context(context)
 
     system_prompt = (
         "You are a knowledgeable product expert. The user is asking about the product below. "
