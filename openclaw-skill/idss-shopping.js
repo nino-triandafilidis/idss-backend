@@ -24,7 +24,7 @@
  *   GET  /search/ebay — eBay listing search with price/condition filters
  */
 
-const IDSS_API_URL = process.env.IDSS_API_URL || 'https://idss-backend.onrender.com';
+const IDSS_API_URL = process.env.IDSS_API_URL || 'https://idss-backend-production.up.railway.app';
 
 // ---------------------------------------------------------------------------
 // Offline-resilient text formatter (used if /chat-text is unavailable)
