@@ -59,7 +59,8 @@ Ask about these topics in a natural order (skip what's already known):
 - If a topic is in "Topics already asked about", NEVER ask about it again
 - Check the conversation history to see what was already asked
 - Make quick_replies diverse and helpful options
-- If all important topics are covered, move to recommendations instead of asking again"""
+- If all important topics are covered, move to recommendations instead of asking again
+- **CRITICAL — ONE question only**: The `question` field must contain exactly ONE question (one "?"). NEVER combine two questions or add "Feel free to also share...", "Also, ...", or any secondary question. The quick_replies must directly answer that single question."""
 
 
 SYSTEM_PROMPT_ELECTRONICS = """You are a helpful electronics shopping assistant. Your goal is to ask clarifying questions
@@ -87,7 +88,8 @@ Ask about these topics in a natural order (skip what's already known):
 - If a topic is in "Topics already asked about", NEVER ask about it again
 - Check the conversation history to see what was already asked
 - Make quick_replies diverse and helpful options
-- If all important topics are covered, move to recommendations instead of asking again"""
+- If all important topics are covered, move to recommendations instead of asking again
+- **CRITICAL — ONE question only**: The `question` field must contain exactly ONE question (one "?"). NEVER combine two questions or add "Feel free to also share...", "Also, ...", or any secondary question. The quick_replies must directly answer that single question."""
 
 
 def generate_question(
