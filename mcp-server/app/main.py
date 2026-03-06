@@ -452,6 +452,25 @@ async def chat_text(request: ChatRequest):
     )
 
 
+# ─── OpenClaw skill file endpoint ────────────────────────────────────────────
+# Serves the idss-shopping.js skill so OpenClaw can self-install it:
+#   "Install this skill from URL: https://idss-backend-production.up.railway.app/skill"
+
+@app.get("/skill")
+async def get_skill():
+    """Serve the IDSS Shopping OpenClaw skill as a downloadable JavaScript file."""
+    from fastapi.responses import Response as _SkillResponse
+    # Skill file lives at openclaw-skill/idss-shopping.js relative to /app in the container
+    _skill_path = Path(__file__).parent.parent.parent / "openclaw-skill" / "idss-shopping.js"
+    if not _skill_path.exists():
+        raise HTTPException(status_code=404, detail="Skill file not found. Check container build.")
+    return _SkillResponse(
+        content=_skill_path.read_text(encoding="utf-8"),
+        media_type="application/javascript",
+        headers={"Content-Disposition": 'attachment; filename="idss-shopping.js"'},
+    )
+
+
 # ─── OpenClaw server-to-server webhook ───────────────────────────────────────
 # OpenClaw calls POST /openclaw/message when a user sends a shopping query via
 # WhatsApp, Telegram, Discord, etc.  We process it through the same AI pipeline

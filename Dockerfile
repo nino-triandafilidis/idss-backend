@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir \
 # Copy application code
 COPY mcp-server/ ./mcp-server/
 COPY agent/ ./agent/
+COPY openclaw-skill/ ./openclaw-skill/
 
 # PYTHONPATH so `from agent import ...` resolves inside mcp-server
 ENV PYTHONPATH=/app

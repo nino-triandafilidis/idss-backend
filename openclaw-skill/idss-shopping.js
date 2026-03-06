@@ -12,13 +12,11 @@
  *
  * Setup:
  *   Option A (recommended — auto-updates): Tell your OpenClaw —
- *     "Install this skill from URL: https://idss.vercel.app/api/skill"
+ *     "Install this skill from URL: https://idss-backend-production.up.railway.app/skill"
  *
  *   Option B (manual):
  *     1. Copy this file into your OpenClaw skills directory
- *     2. Optionally set env vars:
- *          IDSS_CHAT_URL   — Vercel chat proxy  (default: https://idss.vercel.app/api/chat-text)
- *          IDSS_API_URL    — Railway backend     (default: https://idss-backend-production.up.railway.app)
+ *     2. No extra env vars needed — defaults point to Railway already.
  *     3. Restart OpenClaw
  *
  * Platform notes:
@@ -34,7 +32,7 @@
 
 // AI chat routes through the Vercel proxy so all traffic has a single entry point.
 // eBay search goes directly to the Railway backend (no Vercel proxy for this route yet).
-const IDSS_CHAT_URL = process.env.IDSS_CHAT_URL || 'https://idss.vercel.app/api/chat-text';
+const IDSS_CHAT_URL = process.env.IDSS_CHAT_URL || 'https://idss-backend-production.up.railway.app/chat-text';
 const IDSS_API_URL  = process.env.IDSS_API_URL  || 'https://idss-backend-production.up.railway.app';
 
 // ---------------------------------------------------------------------------
@@ -226,7 +224,7 @@ export default {
       const data = await resp.json();
       await send(formatFallback(data) || 'No response from IDSS.');
     } catch (err) {
-      await send(`⚠️ Shopping assistant unavailable. (${err.message})\nTry again or visit idss.vercel.app`);
+      await send(`⚠️ Shopping assistant unavailable. (${err.message})\nTry again in a moment.`);
     }
   },
 
