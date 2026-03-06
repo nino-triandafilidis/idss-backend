@@ -770,6 +770,7 @@ class ProductQARequest(BaseModel):
     product_context: Dict[str, Any]   # full product object from the frontend
     product_id: Optional[str] = None  # if provided, backend fetches full DB record to enrich context
     history: List[Dict[str, str]] = []  # prior panel turns [{"role":…,"content":…}]
+    session_id: Optional[str] = None  # if provided, session preferences are added to context
 
 
 class ProductQAResponse(BaseModel):
@@ -860,12 +861,40 @@ async def product_qa(request: ProductQARequest):
 
     product_text = _format_product_context(context)
 
+    # Build user-preferences context from session when available
+    preferences_text = ""
+    if request.session_id:
+        try:
+            from agent.interview.session_manager import get_session_manager
+            sm = get_session_manager()
+            sess = sm.get_session(request.session_id)
+            prefs = getattr(sess, "agent_filters", {}) or {}
+            if prefs:
+                pref_lines = []
+                _pref_labels = {
+                    "budget": "Budget", "brand": "Preferred brand", "use_case": "Use case",
+                    "min_ram_gb": "Minimum RAM (GB)", "os": "OS",
+                    "excluded_brands": "Excluded brands",
+                    "good_for_gaming": "Good for gaming", "good_for_ml": "Good for ML/AI",
+                }
+                for k, v in prefs.items():
+                    if v and not k.startswith("_"):
+                        label = _pref_labels.get(k, k.replace("_", " ").title())
+                        pref_lines.append(f"  {label}: {v}")
+                if pref_lines:
+                    preferences_text = "\n\nUSER PREFERENCES (gathered during this session):\n" + "\n".join(pref_lines)
+        except Exception:
+            pass  # Preferences are non-critical — never block product Q&A
+
     system_prompt = (
         "You are a knowledgeable product expert. The user is asking about the product below. "
         "Answer concisely (2–4 sentences) and accurately. "
+        "Use the user's stated preferences to tailor your answer when relevant "
+        "(e.g. if they care about ML/AI workloads, emphasise GPU and RAM specs). "
         "If the data doesn't contain a direct answer, give your best general-knowledge response "
         "and clearly note it. Never say 'Based on the data provided' — just answer naturally.\n\n"
         f"PRODUCT DATA:\n{product_text}"
+        f"{preferences_text}"
     )
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]

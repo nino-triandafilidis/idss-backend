@@ -11,20 +11,31 @@
  *   - eBay deal search (uses /search/ebay backend + browser automation fallback)
  *
  * Setup:
- *   Option A (recommended): Tell your OpenClaw —
+ *   Option A (recommended — auto-updates): Tell your OpenClaw —
  *     "Install this skill from URL: https://idss.vercel.app/api/skill"
  *
  *   Option B (manual):
  *     1. Copy this file into your OpenClaw skills directory
- *     2. Set IDSS_API_URL in your OpenClaw environment
+ *     2. Optionally set env vars:
+ *          IDSS_CHAT_URL   — Vercel chat proxy  (default: https://idss.vercel.app/api/chat-text)
+ *          IDSS_API_URL    — Railway backend     (default: https://idss-backend-production.up.railway.app)
  *     3. Restart OpenClaw
  *
+ * Platform notes:
+ *   WhatsApp / Slack — *bold* text is rendered natively.
+ *   Discord          — Discord renders *text* as italic; bold is **text**, but
+ *                      the formatted output is still readable in plain mode.
+ *   iMessage / SMS   — Plain text only; formatting characters appear as-is.
+ *
  * API endpoints used:
- *   POST /chat-text  — AI shopping assistant, returns pre-formatted text
- *   GET  /search/ebay — eBay listing search with price/condition filters
+ *   POST /api/chat-text (Vercel proxy) — AI chat, returns pre-formatted text
+ *   GET  /search/ebay   (Railway)      — eBay listing search
  */
 
-const IDSS_API_URL = process.env.IDSS_API_URL || 'https://idss-backend-production.up.railway.app';
+// AI chat routes through the Vercel proxy so all traffic has a single entry point.
+// eBay search goes directly to the Railway backend (no Vercel proxy for this route yet).
+const IDSS_CHAT_URL = process.env.IDSS_CHAT_URL || 'https://idss.vercel.app/api/chat-text';
+const IDSS_API_URL  = process.env.IDSS_API_URL  || 'https://idss-backend-production.up.railway.app';
 
 // ---------------------------------------------------------------------------
 // Offline-resilient text formatter (used if /chat-text is unavailable)
@@ -189,7 +200,7 @@ export default {
 
     // Try /chat-text first (backend-formatted, most reliable)
     try {
-      const resp = await fetch(`${IDSS_API_URL}/chat-text`, {
+      const resp = await fetch(IDSS_CHAT_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text, session_id: sessionId }),

@@ -273,6 +273,53 @@ class ChatResponse(BaseModel):
 
 
 # ============================================================================
+# Preferences Summary Builder
+# ============================================================================
+
+def _build_preferences_summary(filters: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a human-readable preferences dict from accumulated agent filters.
+
+    This is returned in every ChatResponse.preferences so the frontend can
+    show users what the AI has learned about their needs (e.g. "ML GPUs,
+    high storage, budget $1500").  Only includes values the user has actually
+    stated — not inferred defaults.
+    """
+    if not filters:
+        return {}
+
+    prefs: Dict[str, Any] = {}
+    _SKIP = {"_soft_preferences", "category", "product_type", "product_subtype"}
+
+    label_map = {
+        "budget": "Budget",
+        "brand": "Preferred brand",
+        "use_case": "Use case",
+        "min_ram_gb": "Minimum RAM (GB)",
+        "screen_size": "Screen size",
+        "storage_type": "Storage type",
+        "os": "OS",
+        "excluded_brands": "Excluded brands",
+        "good_for_gaming": "Good for gaming",
+        "good_for_ml": "Good for ML/AI",
+        "good_for_creative": "Good for creative work",
+        "good_for_web_dev": "Good for web dev",
+        "genre": "Genre",
+        "format": "Format",
+        "body_style": "Body style",
+        "fuel_type": "Fuel type",
+    }
+
+    for key, value in filters.items():
+        if key in _SKIP or not value:
+            continue
+        label = label_map.get(key, key.replace("_", " ").title())
+        prefs[label] = value
+
+    return prefs
+
+
+# ============================================================================
 # Chat Endpoint Logic
 # ============================================================================
 
@@ -416,7 +463,7 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
             session_id=session_id,
             quick_replies=agent_response.get("quick_replies"),
             filters=agent.get_search_filters(),
-            preferences={},
+            preferences=_build_preferences_summary(agent.filters),
             question_count=agent_response.get("question_count", session.question_count),
             domain=agent_response.get("domain"),
             timings_ms={**agent_response.get("timings_ms", {}), **timings, "total_backend_ms": (time.perf_counter() - t_start) * 1000}
@@ -929,6 +976,12 @@ async def _handle_post_recommendation(
         # explicit handlers below can act on them without an LLM call.
         "increase my budget", "try a different brand",
         "show me all laptops", "show me all books",
+        # Use-case quick-replies from interview phase that stay visible after
+        # recommendations are shown.  Treat as preference refinement, NOT new_search,
+        # so clicking "Work/Business" or "School/Study" post-recommendations filters
+        # results instead of wiping the session and re-asking the interview.
+        "work/business", "school/study", "creative work", "general use",
+        "home use", "school", "business", "office",
     )
     # Exact brand names that can come in as standalone quick-reply selections
     # (e.g. user chose "Acer" from the brand picker). Use exact equality —
@@ -1396,6 +1449,52 @@ async def _handle_post_recommendation(
         brand_name = _BRAND_DISPLAY[msg_lower.strip()]
         agent = UniversalAgent.restore_from_session(session_id, session)
         agent.filters["brand"] = brand_name
+        search_filters = agent.get_search_filters()
+        agent_state = agent.get_state()
+        session.agent_filters = agent_state["filters"]
+        session_manager.update_filters(session_id, search_filters)
+        session_manager._persist(session_id)
+        if active_domain == "vehicles":
+            return await _search_and_respond_vehicles(
+                search_filters, session_id, session, session_manager,
+                n_rows=request.n_rows or 3, n_per_row=request.n_per_row or 3,
+                method=request.method or "embedding_similarity",
+                question_count=session.question_count,
+                agent=agent,
+            )
+        category = _domain_to_category(active_domain)
+        search_filters["category"] = category
+        search_filters["product_type"] = "laptop" if active_domain == "laptops" else "book"
+        return await _search_and_respond_ecommerce(
+            search_filters, category, active_domain, session_id, session, session_manager,
+            n_rows=request.n_rows or 2, n_per_row=request.n_per_row or 3,
+            question_count=session.question_count,
+            agent=agent,
+        )
+
+    # -----------------------------------------------------------------------
+    # Use-case quick-reply handler — user clicked a use-case chip like
+    # "Gaming", "Work/Business", "School/Study" that was shown during the
+    # interview phase and is still visible after recommendations.
+    # Directly update the use_case filter and re-search instead of letting
+    # the LLM intent router misclassify these as "new_search".
+    # -----------------------------------------------------------------------
+    _USE_CASE_QR: dict = {
+        "gaming": "gaming",
+        "work/business": "business",
+        "school/study": "school",
+        "creative work": "creative",
+        "general use": "general",
+        "home use": "home",
+        "school": "school",
+        "business": "business",
+        "office": "business",
+    }
+    if msg_lower.strip() in _USE_CASE_QR and active_domain in ("laptops", "books", "vehicles"):
+        session_manager.add_message(session_id, "user", request.message)
+        use_case_val = _USE_CASE_QR[msg_lower.strip()]
+        agent = UniversalAgent.restore_from_session(session_id, session)
+        agent.filters["use_case"] = use_case_val
         search_filters = agent.get_search_filters()
         agent_state = agent.get_state()
         session.agent_filters = agent_state["filters"]
@@ -2100,7 +2199,7 @@ async def _search_and_respond_ecommerce(
         recommendations=recs,
         bucket_labels=labels,
         filters=search_filters,
-        preferences=search_filters.get("_soft_preferences", {}),
+        preferences=_build_preferences_summary(agent.filters if agent else {}),
         question_count=question_count,
         quick_replies=_recommendation_quick_replies(flat_data, search_filters),
         timings_ms=timings

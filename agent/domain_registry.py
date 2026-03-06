@@ -285,7 +285,85 @@ PHONES_SCHEMA = DomainSchema(
     ]
 )
 
-# 4. Books Schema
+# 4. Cameras Schema
+# DB attribute keys: megapixels (float), sensor_type (str), lens_mount (str),
+# video_resolution (str), image_stabilization (bool), weather_sealed (bool),
+# burst_fps (float).  Import via: python -m app.csv_importer --product-type camera
+CAMERA_SCHEMA = DomainSchema(
+    domain="cameras",
+    description="Digital cameras: DSLRs, mirrorless, point-and-shoot, action cameras.",
+    slots=[
+        PreferenceSlot(
+            name="budget",
+            display_name="Budget",
+            priority=SlotPriority.HIGH,
+            description="Price range for the camera body (not including lenses).",
+            example_question="What is your budget for the camera?",
+            example_replies=["Under $500", "$500-$1000", "$1000-$2500", "Over $2500"],
+            filter_key="price_max_cents",
+        ),
+        PreferenceSlot(
+            name="use_case",
+            display_name="Primary Use",
+            priority=SlotPriority.HIGH,
+            description=(
+                "What the user will primarily shoot. "
+                "Map to one of: 'portrait', 'wildlife', 'travel', 'video', 'sports', 'landscape', 'beginner'."
+            ),
+            example_question="What will you mainly photograph or film?",
+            example_replies=["Portraits / people", "Wildlife / sports", "Travel / everyday", "Video / filmmaking", "I'm a beginner"],
+        ),
+        PreferenceSlot(
+            name="sensor_type",
+            display_name="Sensor Size",
+            priority=SlotPriority.MEDIUM,
+            description="Camera sensor format. Larger sensors capture more light.",
+            example_question="Do you have a sensor size preference?",
+            example_replies=["Full Frame", "APS-C", "Micro Four Thirds", "No preference"],
+            filter_key="sensor_type",
+            allowed_values=["Full Frame", "APS-C", "Micro Four Thirds", "1-inch", "Medium Format"],
+        ),
+        PreferenceSlot(
+            name="brand",
+            display_name="Brand",
+            priority=SlotPriority.MEDIUM,
+            description="Preferred camera manufacturer.",
+            example_question="Do you have a preferred camera brand?",
+            example_replies=["No preference", "Sony", "Canon", "Nikon", "Fujifilm"],
+            filter_key="brand",
+            allowed_values=["Sony", "Canon", "Nikon", "Fujifilm", "Panasonic",
+                            "Olympus", "OM System", "Leica", "Pentax", "GoPro"],
+        ),
+        PreferenceSlot(
+            name="video_resolution",
+            display_name="Video Quality",
+            priority=SlotPriority.LOW,
+            description=(
+                "Required video resolution. Extract when user mentions '4K', '6K', '8K', or 'video first'. "
+                "NEVER ask unless user mentions video as a priority."
+            ),
+            example_question="Do you need a specific video resolution?",
+            example_replies=["4K is enough", "Need 6K or higher", "No video needed"],
+            filter_key="video_resolution",
+        ),
+        PreferenceSlot(
+            name="weather_sealed",
+            display_name="Weather Sealing",
+            priority=SlotPriority.LOW,
+            description=(
+                "Whether the user requires weather sealing / weather resistance. "
+                "Extract when user says 'outdoor', 'rain', 'weather sealed', 'rugged'. "
+                "NEVER ask — only extract when explicitly stated."
+            ),
+            example_question="Do you need weather sealing?",
+            example_replies=["Yes, must be weather sealed", "No preference"],
+            filter_key="weather_sealed",
+        ),
+    ],
+)
+
+
+# 5. Books Schema
 BOOK_SCHEMA = DomainSchema(
     domain="books",
     description="Fiction and non-fiction books, novels, and literature.",
@@ -325,10 +403,11 @@ BOOK_SCHEMA = DomainSchema(
 # Registry Access
 # ============================================================================
 
-# Only: vehicles, laptops, books, phones (real scraped products)
+# Registered domains (have scraped or CSV-imported products in Supabase)
 DOMAIN_REGISTRY = {
     VEHICLE_SCHEMA.domain: VEHICLE_SCHEMA,
     LAPTOP_SCHEMA.domain: LAPTOP_SCHEMA,
+    CAMERA_SCHEMA.domain: CAMERA_SCHEMA,
     BOOK_SCHEMA.domain: BOOK_SCHEMA,
     PHONES_SCHEMA.domain: PHONES_SCHEMA,
 }
