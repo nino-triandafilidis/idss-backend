@@ -127,6 +127,37 @@ async def _is_prompt_injection(message: str) -> bool:
 
 
 # ============================================================================
+# Probe search — lightweight candidate fetch for entropy-based Q selection
+# Called by UniversalAgent._entropy_next_slot() via dependency injection.
+# ============================================================================
+
+def _probe_search(slot_filters: dict, limit: int = 30) -> list:
+    """
+    Run a quick search with the current slot filters and return raw product dicts.
+    Used by UniversalAgent._entropy_next_slot() to compute slot entropy.
+    Returns [] on any error so the agent falls back to priority ordering.
+    """
+    try:
+        from app.tools.supabase_product_store import get_product_store
+
+        f: dict = {"product_type": "laptop"}
+        if "price_max_cents" in slot_filters:
+            f["price_max"] = int(slot_filters["price_max_cents"]) // 100
+        elif "budget" in slot_filters:
+            raw = int(slot_filters["budget"])
+            f["price_max"] = raw // 100 if raw > 10_000 else raw
+        if "brand" in slot_filters:
+            f["brand"] = str(slot_filters["brand"])
+        if "min_ram_gb" in slot_filters:
+            f["min_ram_gb"] = int(slot_filters["min_ram_gb"])
+
+        store = get_product_store()
+        return store.search_products(f, limit=limit)
+    except Exception:
+        return []
+
+
+# ============================================================================
 # Popular-question cache — instant answers for frequently asked questions
 # Keys are lowercase canonical forms; values are (message, quick_replies) tuples.
 # Lookup uses _normalize_for_cache() so minor wording variations match.
@@ -403,9 +434,9 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
     t_agent = time.perf_counter()
     # Restore agent from session or create new
     if session.active_domain:
-        agent = UniversalAgent.restore_from_session(session_id, session)
+        agent = UniversalAgent.restore_from_session(session_id, session, probe_search_fn=_probe_search)
     else:
-        agent = UniversalAgent(session_id=session_id, max_questions=request.k if request.k is not None else 3)
+        agent = UniversalAgent(session_id=session_id, max_questions=request.k if request.k is not None else 3, probe_search_fn=_probe_search)
 
     # Override max_questions if k=0 (skip interview)
     if request.k == 0:
@@ -865,8 +896,52 @@ def _explain_best_value(product: dict, domain: str, all_products: Optional[list]
             break
         bullets.append(fb)
 
-    bullets_md = "\n".join(f"- {b}" for b in bullets[:6])  # cap at 6 to keep it clean
-    return f"**{name}** is the best value pick:\n\n{bullets_md}"
+    # --- Cons section (≤2 weaknesses, ⚠️ prefix) ---
+    cons: list[str] = []
+    if all_products and len(all_products) > 1:
+        # Re-read prices to find max
+        _all_prices: list[float] = []
+        for _p in all_products:
+            try:
+                _v = float(_p.get("price") or _p.get("price_value") or 0)
+                if _v > 0:
+                    _all_prices.append(_v)
+            except (TypeError, ValueError):
+                pass
+        if _all_prices and price_float > 0 and price_float >= max(_all_prices):
+            cons.append("**Most expensive** option — pricier than the alternatives in these results")
+
+        try:
+            _ram = int(attrs.get("ram_gb") or 0)
+            if 0 < _ram < 16:
+                cons.append(f"**Only {_ram}GB RAM** — may feel limited for heavy multitasking or future-proofing")
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            _batt = float(attrs.get("battery_life_hours") or 0)
+            if 0 < _batt < 6:
+                cons.append(f"**Battery life is {int(_batt)}h** — shorter than average; keep charger handy")
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            _r = float(product.get("rating") or 0)
+            if 0 < _r < 4.0:
+                cons.append(f"**Reviews are mixed ({_r:.1f}/5)** — read user feedback before buying")
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            _stor = int(attrs.get("storage_gb") or 0)
+            if 0 < _stor < 256:
+                cons.append(f"**Only {_stor}GB storage** — may need external storage or cloud")
+        except (TypeError, ValueError):
+            pass
+
+    bullets_md = "\n".join(f"- {b}" for b in bullets[:6])  # cap at 6 pros
+    cons_md = ("\n" + "\n".join(f"- ⚠️ {c}" for c in cons[:2])) if cons else ""
+    return f"**{name}** is the best value pick:\n\n{bullets_md}{cons_md}"
 
 
 # ============================================================================

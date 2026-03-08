@@ -28,6 +28,7 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from .domain_registry import get_domain_schema, DomainSchema, SlotPriority, PreferenceSlot
+from .query_rewriter import rewrite as _rewrite_query
 from .prompts import (
     DOMAIN_DETECTION_PROMPT,
     CRITERIA_EXTRACTION_PROMPT,
@@ -224,12 +225,19 @@ class GeneratedQuestion(BaseModel):
     topic: str = Field(description="The main topic this question addresses")
 
 class UniversalAgent:
-    def __init__(self, session_id: str, history: Optional[List[Dict[str, str]]] = None, max_questions: int = DEFAULT_MAX_QUESTIONS):
+    def __init__(
+        self,
+        session_id: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        max_questions: int = DEFAULT_MAX_QUESTIONS,
+        probe_search_fn=None,
+    ):
         self.session_id = session_id
         self.history: List[Any] = history or []
         self.domain: Optional[str] = None
         self.filters: Dict[str, Any] = {}
         self.state = AgentState.INTENT_DETECTION
+        self._probe_search_fn = probe_search_fn  # injected by chat_endpoint for entropy
 
         # IDSS interview state
         self.question_count = 0
@@ -243,12 +251,13 @@ class UniversalAgent:
         self.client = OpenAI(timeout=10.0, max_retries=0)
 
     @classmethod
-    def restore_from_session(cls, session_id: str, session_state) -> "UniversalAgent":
+    def restore_from_session(cls, session_id: str, session_state, probe_search_fn=None) -> "UniversalAgent":
         """Reconstruct agent from persisted session state."""
         agent = cls(
             session_id=session_id,
             history=list(session_state.agent_history) if session_state.agent_history else [],
             max_questions=DEFAULT_MAX_QUESTIONS,
+            probe_search_fn=probe_search_fn,
         )
         agent.domain = session_state.active_domain
         agent.filters = dict(session_state.agent_filters) if session_state.agent_filters else {}
@@ -434,6 +443,26 @@ class UniversalAgent:
         t0 = time.perf_counter()
         self.history.append({"role": "user", "content": message})
 
+        # 0. Query rewriting — expand vague references, accessory disambiguation
+        _rr = _rewrite_query(
+            message=message,
+            session_history=self.history[:-1],
+            domain=self.domain or "",
+            current_filters=self.filters,
+            question_count=self.question_count,
+        )
+        if _rr.is_clarification:
+            self.history.append({"role": "assistant", "content": _rr.clarifying_question})
+            return {
+                "response_type": "question",
+                "message": _rr.clarifying_question,
+                "quick_replies": _rr.quick_replies or [],
+                "session_id": self.session_id,
+                "domain": self.domain,
+                "timings_ms": timings,
+            }
+        message = _rr.rewritten
+
         # 1. Domain Detection — run when domain is unknown, or when message contains
         # fast-map keywords that clearly indicate a different domain (zero-latency switch).
         t1 = time.perf_counter()
@@ -491,44 +520,6 @@ class UniversalAgent:
                 self.filters.pop(slot, None)
             logger.info(f"Preference reset detected — cleared soft slots: {_soft_slots}")
 
-        # ── Accessory / subtype ambiguity check ─────────────────────────────────
-        # If the user mentions a domain keyword AND an accessory keyword in the
-        # same message, they may mean a peripheral rather than the main product.
-        # Ask a clarifying question rather than silently routing to the main domain.
-        msg_words = set(re.sub(r"[^a-z0-9 ]", " ", message.lower()).split())
-        accessory_hit = msg_words & self._ACCESSORY_KEYWORDS
-        spec_hit = msg_words & self._SPEC_SIGNALS
-        # Only ask the accessory clarification if:
-        # - an accessory keyword is present
-        # - no spec-signal words are present (spec signals = clearly about the product itself)
-        # - message is short (long messages = detailed spec queries, not accessory requests)
-        if accessory_hit and self.question_count == 0 and not spec_hit and len(msg_words) < 20:
-            domain_label = {
-                "laptops": "laptop", "vehicles": "vehicle", "books": "book"
-            }.get(self.domain, self.domain)
-            accessory_example = next(iter(accessory_hit))
-            clarify_msg = (
-                f"Are you looking for a **{domain_label}** itself, or a "
-                f"**{domain_label} accessory** (like a {accessory_example})?"
-            )
-            logger.info(
-                f"Accessory ambiguity: domain={self.domain}, "
-                f"accessory_hit={accessory_hit} — asking clarification"
-            )
-            response = {
-                "response_type": "question",
-                "message": clarify_msg,
-                "quick_replies": [
-                    f"The {domain_label} itself",
-                    f"A {domain_label} accessory",
-                ],
-                "session_id": self.session_id,
-                "domain": self.domain,
-                "timings_ms": timings,
-            }
-            self.history.append({"role": "assistant", "content": clarify_msg})
-            return response
-
         # 2. Extract Criteria (Schema-Driven) with IDSS signals
         schema = get_domain_schema(self.domain)
         if not schema:
@@ -550,8 +541,8 @@ class UniversalAgent:
             resp["timings_ms"] = timings
             return resp
 
-        # 4. Check for Missing Information (Priority Check)
-        missing_slot = self._get_next_missing_slot(schema)
+        # 4. Check for Missing Information (entropy-aware selection)
+        missing_slot = self._entropy_next_slot(schema)
 
         if missing_slot:
             # 5. Generate Question (LLM)
@@ -1134,6 +1125,105 @@ class UniversalAgent:
         # LOW Priorities - strictly optional, skip for now
         # Could be enabled if we want more detailed interviews
         return None
+
+    # Maps askable slot names → product attribute keys used in entropy computation.
+    # Only slots with a direct DB attribute mapping are included.
+    _SLOT_TO_ATTR: Dict[str, str] = {
+        "budget":      "price",
+        "brand":       "brand",
+        "min_ram_gb":  "ram_gb",
+        "screen_size": "screen_size",
+        "storage_type": "storage_type",
+    }
+
+    def _entropy_next_slot(self, schema: DomainSchema) -> Optional[PreferenceSlot]:
+        """
+        Select the next interview question using information-gain (entropy).
+
+        Strategy:
+        - Question 1: always use priority system (no filters yet to probe with).
+        - Questions 2+: run a lightweight probe search with current filters,
+          compute Shannon entropy per unasked slot dimension, pick the one
+          with highest entropy (= most information gained by asking it).
+        - Fallback to priority system if probe returns <5 candidates or
+          no probe_search_fn is injected.
+
+        This replaces the rigid HIGH→MEDIUM→LOW order for follow-up questions.
+        """
+        # Q1 or no probe function — fall back to priority order
+        if self.question_count == 0 or not self._probe_search_fn:
+            return self._get_next_missing_slot(schema)
+
+        # Get candidate products with current filters
+        try:
+            candidates: List[Dict[str, Any]] = self._probe_search_fn(self.filters, limit=30)
+        except Exception:
+            candidates = []
+
+        if len(candidates) < 5:
+            return self._get_next_missing_slot(schema)
+
+        # Find unasked, non-extract-only slots that have a product attribute mapping
+        askable = [
+            s for s in schema.slots
+            if s.name not in self._EXTRACT_ONLY_SLOTS
+            and s.name not in self.filters
+            and s.name not in self.questions_asked
+            and s.name in self._SLOT_TO_ATTR
+        ]
+        if not askable:
+            return self._get_next_missing_slot(schema)
+
+        # Compute entropy for each candidate slot dimension.
+        # Use compute_shannon_entropy with manual extraction — compute_dimension_entropy
+        # uses vehicle-specific getters and doesn't handle nested laptop attributes.
+        try:
+            from idss.diversification.entropy import (  # noqa: PLC0415
+                compute_shannon_entropy,
+                bucket_numerical_values,
+            )
+        except ImportError:
+            return self._get_next_missing_slot(schema)
+
+        _NUMERICAL_ATTRS = {"price", "ram_gb", "screen_size"}
+
+        def _extract_attr(product: Dict[str, Any], attr: str):
+            """Extract a laptop attribute from product dict (handles nested attrs)."""
+            # Try top-level first (price, brand)
+            val = product.get(attr) or product.get("price_value") if attr == "price" else product.get(attr)
+            if val is None:
+                # Try nested attributes dict (ram_gb, screen_size, storage_type)
+                attrs = product.get("attributes") or {}
+                val = attrs.get(attr)
+            return val
+
+        best_slot: Optional[PreferenceSlot] = None
+        best_entropy = -1.0
+        for slot in askable:
+            attr = self._SLOT_TO_ATTR[slot.name]
+            try:
+                raw_vals = [_extract_attr(p, attr) for p in candidates]
+                non_null = [v for v in raw_vals if v is not None]
+                if len(non_null) < 3:
+                    continue
+                if attr in _NUMERICAL_ATTRS:
+                    floats = [float(v) for v in non_null]
+                    buckets, _ = bucket_numerical_values(floats, n_buckets=3)
+                    h = compute_shannon_entropy(buckets)
+                else:
+                    h = compute_shannon_entropy(non_null)
+                logger.info(f"Entropy slot={slot.name} attr={attr} H={h:.3f}")
+                if h > best_entropy:
+                    best_entropy = h
+                    best_slot = slot
+            except Exception:
+                pass
+
+        if best_slot:
+            logger.info(f"Entropy-selected next slot: {best_slot.name} (H={best_entropy:.3f})")
+            return best_slot
+
+        return self._get_next_missing_slot(schema)
 
     def _get_invite_topics(self, main_slot: PreferenceSlot, schema: DomainSchema) -> List[str]:
         """

@@ -133,6 +133,7 @@ Write a SHORT message that presents each product as a concise bullet point:
 • One bullet per product (use the • character).
 • Each bullet: product name — 1 short sentence highlighting its best quality or key stat (price, spec, use case).
 • End with a one-sentence "Best pick:" line naming your top recommendation and why.
+• After the "Best pick:" line, add a "⚠️ Trade-off:" sentence mentioning 1 real limitation (price, RAM, battery, mixed reviews) if one clearly exists. Omit entirely if the product is strong across the board.
 
 Rules:
 - Use the • bullet character (not dashes or numbers).
