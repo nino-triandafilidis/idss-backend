@@ -1071,6 +1071,15 @@ async def _handle_post_recommendation(
         "best for college",
         "best for everyday",
         "best for work",
+        # Moved here from _FAST_COMPARE_KWS — these are "pick a winner" questions,
+        # not full comparison tables.  targeted_qa returns 1-2 cards with reasoning.
+        "best for students",          # "Which of these laptops is best for students?"
+        "best for gaming",            # "Which of these laptops is best for gaming?"
+        # Conceptual spec questions — should be answered with prose, not a table.
+        # generate_targeted_answer receives the full question so the LLM can explain
+        # the real-world meaning of a spec difference (e.g. 16GB vs 64GB RAM).
+        "real-world difference",      # "What's the real-world difference between 16GB and 64GB?"
+        "real world difference",
     )
     # Explicit compare (user named products or pressed Compare dialog) → show cards
     # Also catches all ActionBar common-question chips so they never hit the LLM
@@ -1081,8 +1090,8 @@ async def _handle_post_recommendation(
         "compare the top",              # "Compare the top two picks side by side"
         "which is better", "which should i buy",
         # ActionBar common-question chips (predictable exact substrings)
-        "best for gaming",            # "Which of these laptops is best for gaming?"
-        "best for students",          # "Which of these laptops is best for students"
+        # NOTE: "best for gaming" and "best for students" moved to _FAST_TARGETED_QA_KWS
+        # so they return a focused winner answer (not a full comparison table).
         "battery life on these",      # "How is the battery life on these laptops?"
         "detailed specs of each",     # "What are the detailed specs of each"
         "specs of each",              # fallback match
@@ -2399,6 +2408,25 @@ async def _search_and_respond_ecommerce(
     session_manager.set_last_recommendations(session_id, all_ids)
     session_manager.set_last_recommendation_data(session_id, flat_data)
 
+    # ── Brand-relaxation disclosure ───────────────────────────────────────────
+    # If the user requested a specific brand but none of the returned products
+    # match it, the store must have dropped the brand constraint during relaxation.
+    # Prepend a transparent notice so the user knows why results differ.
+    _requested_brand = str(search_filters.get("brand") or "").strip()
+    _brand_disclosure = ""
+    if _requested_brand and _requested_brand.lower() not in ("no preference", "any", "", "null"):
+        def _product_matches_brand(p: dict, brand_lower: str) -> bool:
+            name = (p.get("name") or p.get("title") or "").lower()
+            brand = (p.get("brand") or "").lower()
+            return brand_lower in brand or brand_lower in name
+        _brand_lower = _requested_brand.lower()
+        _any_match = any(_product_matches_brand(p, _brand_lower) for p in flat_data)
+        if not _any_match:
+            _brand_disclosure = (
+                f"⚠️ We couldn't find **{_requested_brand}** laptops matching all your specs. "
+                f"Here are the best alternatives from other brands:\n\n"
+            )
+
     product_label = "laptops" if domain == "laptops" else "books"
     # Generate conversational explanation — run in thread to avoid blocking the event loop
     message = f"Here are top {product_label} recommendations. What would you like to do next?"
@@ -2439,9 +2467,10 @@ async def _search_and_respond_ecommerce(
         logger.error("best_pick_auto_failed", f"Could not auto-select best pick: {e}", {})
 
     timings["ecommerce_formatting_ms"] = (time.perf_counter() - t_format) * 1000
+    final_message = _brand_disclosure + message if _brand_disclosure else message
     return ChatResponse(
         response_type="recommendations",
-        message=message,
+        message=final_message,
         session_id=session_id,
         domain=domain,
         recommendations=recs,
