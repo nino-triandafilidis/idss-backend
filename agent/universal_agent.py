@@ -853,6 +853,18 @@ class UniversalAgent:
                 logger.info(f"Extracted filters (normalised): {new_filters}")
                 self.filters.update(new_filters)
 
+            # Mirror regex fallback heuristic: if user provides ≥3 substantive criteria
+            # in a single non-question message, they've stated their requirements →
+            # proceed to search without asking more questions.
+            if result.criteria and not result.wants_recommendations:
+                substantive = [c for c in result.criteria if c.slot_name not in ("os", "excluded_brands")]
+                if len(substantive) >= 3 and "?" not in message:
+                    result.wants_recommendations = True
+                    logger.info(
+                        f"Criteria heuristic: {len(substantive)} substantive criteria, no '?' → "
+                        "wants_recommendations=True"
+                    )
+
             # Log IDSS signals
             if result.is_impatient:
                 logger.info("User is impatient - will skip to recommendations")

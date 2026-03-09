@@ -1048,6 +1048,9 @@ async def _handle_post_recommendation(
         # NOT a comparison table. Keep them here so they bypass the compare handler.
         "what do you get for the extra",  # RAG chip: "What do you get for the extra $X?"
         "trade-off", "trade off", "tradeoff", "tradeoffs",  # "What are the trade-offs?"
+        # Battery life questions — user wants text answer for all products, not a spec table
+        "battery life on these",      # "How is the battery life on these laptops?"
+        "how is the battery",         # "How is the battery life on..."
     )
     # Targeted Q&A: "which has the best X?" → show only the 1-2 winning products
     # with detailed reasoning.  Must be checked BEFORE _FAST_COMPARE_KWS because
@@ -1092,7 +1095,6 @@ async def _handle_post_recommendation(
         # ActionBar common-question chips (predictable exact substrings)
         # NOTE: "best for gaming" and "best for students" moved to _FAST_TARGETED_QA_KWS
         # so they return a focused winner answer (not a full comparison table).
-        "battery life on these",      # "How is the battery life on these laptops?"
         "detailed specs of each",     # "What are the detailed specs of each"
         "specs of each",              # fallback match
         "each of these",              # general anaphoric follow-up ("is each of these...")
@@ -1240,6 +1242,51 @@ async def _handle_post_recommendation(
             if _ctx_filtered:
                 products = _ctx_filtered
         if products:
+            # ------------------------------------------------------------------
+            # Special case: "What do you get for the extra $X between cheapest
+            # and most expensive?" → compare ONLY those 2 products side-by-side
+            # with product cards.  Do NOT show all products' feature bullets.
+            # ------------------------------------------------------------------
+            _is_price_spread_q = "what do you get for the extra" in msg_lower
+            if _is_price_spread_q:
+                _priced = [p for p in products if p.get("price") is not None]
+                if len(_priced) >= 2:
+                    _sorted_price = sorted(_priced, key=lambda p: float(p.get("price") or 0))
+                    _two_products = [_sorted_price[0], _sorted_price[-1]]
+                    try:
+                        _spread_narrative, _spread_sel_ids, _spread_sel_names = await generate_comparison_narrative(
+                            _two_products, clean_message, active_domain or "laptops"
+                        )
+                    except Exception as _e:
+                        logger.error("price_spread_compare_failed", str(_e), {})
+                        _spread_narrative = "Sorry, I had trouble comparing those two products. Try asking again."
+                        _spread_sel_ids, _spread_sel_names = [], []
+                    # Filter to just the 2 selected products for card display
+                    _spread_prods = _two_products
+                    if _spread_sel_ids:
+                        _spread_prods = [
+                            p for p in _two_products
+                            if str(p.get("id") or p.get("product_id", "")) in [str(s) for s in _spread_sel_ids]
+                        ] or _two_products
+                    from app.formatters import format_product
+                    _fmt_domain = "books" if _domain_to_category(active_domain) == "Books" else (active_domain or "laptops")
+                    _spread_formatted = [
+                        format_product(p, _fmt_domain).model_dump(mode="json", exclude_none=True)
+                        for p in _spread_prods
+                    ]
+                    return ChatResponse(
+                        response_type="recommendations",
+                        message=_spread_narrative,
+                        session_id=session_id,
+                        quick_replies=["Show me the best value", "See similar items", "Refine search"],
+                        recommendations=[_spread_formatted] if _spread_formatted else [],
+                        bucket_labels=["Compared Items"] if _spread_formatted else [],
+                        filters=session.explicit_filters,
+                        preferences={},
+                        question_count=session.question_count,
+                        domain=active_domain,
+                    )
+
             # ------------------------------------------------------------------
             # Narrative cache: keyed on sorted product IDs (TTL 10 min).
             # Same products → same narrative → instant on repeat clicks.
@@ -2651,11 +2698,11 @@ def _recommendation_quick_replies(products: List[Dict], search_filters: Dict) ->
             replies.append(e)
 
     # ── Universal fallbacks ───────────────────────────────────────────────────
+    # Note: "Get best value" and "Refine search" action buttons already exist in the
+    # action bar — don't duplicate them in RAG chips.
     for f in [
-        "Which is the best value for money?",
-        "Compare the top two picks side by side",
         "Show lighter alternatives",
-        "Refine my search",
+        "Compare the top two picks side by side",
     ]:
         if len(replies) >= 5:
             break
