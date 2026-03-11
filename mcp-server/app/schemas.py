@@ -487,4 +487,9 @@ class UnifiedProduct(BaseModel):
     # Examples: ["✓ Good battery life", "✓ Modular & repairable", "↳ Best value in tier"]
     why_picked: Optional[List[str]] = Field(None, description="Short bullet reasons this product was recommended")
 
+    # Clean bullet-point summary of the raw description field.
+    # Generated server-side by formatters._parse_description_bullets().
+    # 3-5 concise items stripped of marketing filler.
+    description_bullets: Optional[List[str]] = Field(None, description="Parsed description as 3-5 clean bullets")
+
     model_config = ConfigDict(extra="ignore")
