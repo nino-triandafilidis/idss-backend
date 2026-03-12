@@ -3,7 +3,7 @@
 
 ## Quick Start (TL;DR)
 
-**Start all local servers (backend, MCP, frontend):**
+**Start all local servers (backend + frontend):**
 
 ```bash
 bash start_all_local.sh
@@ -13,7 +13,13 @@ bash start_all_local.sh
 
 ```bash
 bash run_all_tests.sh
+# Expected: 571 backend tests pass, 126 frontend tests pass (March 2026)
 ```
+
+**Deployed URLs:**
+
+- Frontend: <https://idss-web.vercel.app> (Vercel)
+- Backend API: see Railway dashboard → your project → deployment URL
 
 ---
 
