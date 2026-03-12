@@ -351,6 +351,27 @@ def get_metrics():
 # Chat Endpoint (IDSS-compatible)
 #
 
+def _log_conversation_turn(session_id: str, user_msg: str, response: ChatResponse) -> None:
+    """Append one conversation turn to logs/conversations.jsonl (fire-and-forget)."""
+    try:
+        log_dir = Path(__file__).parent.parent.parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        entry = {
+            "ts": _datetime.utcnow().isoformat() + "Z",
+            "session_id": session_id,
+            "domain": response.domain,
+            "user": user_msg[:500],
+            "assistant_type": response.response_type,
+            "assistant": response.message[:500] if response.message else "",
+            "filters": response.filters,
+            "question_count": response.question_count,
+        }
+        with open(log_dir / "conversations.jsonl", "a", encoding="utf-8") as f:
+            f.write(_json.dumps(entry) + "\n")
+    except Exception:
+        pass  # logging must never break the response
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
@@ -368,7 +389,9 @@ async def chat(request: ChatRequest):
     - n_rows: Number of result rows
     - n_per_row: Items per row
     """
-    return await process_chat(request)
+    response = await process_chat(request)
+    _log_conversation_turn(response.session_id, request.message, response)
+    return response
 
 
 # ─── Text-only chat endpoint (for messaging apps via OpenClaw) ────────────────
@@ -864,6 +887,78 @@ def _format_product_context(pc: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _product_qa_fallback(question: str, context: dict) -> str:
+    """Return a structured answer from product fields when the LLM is unavailable."""
+    q = question.lower()
+    name = context.get("name") or context.get("title") or "This product"
+
+    # Price
+    if any(w in q for w in ("price", "cost", "how much", "expensive", "cheap")):
+        price = context.get("price_value") or context.get("price")
+        if price:
+            return f"{name} is priced at ${float(price):,.2f}."
+
+    # RAM
+    if "ram" in q or "memory" in q:
+        attrs = context.get("attributes") or {}
+        ram = attrs.get("ram") or attrs.get("memory") or context.get("ram")
+        if ram:
+            return f"{name} has {ram} of RAM."
+
+    # Storage
+    if "storage" in q or "ssd" in q or "hdd" in q or "hard drive" in q:
+        attrs = context.get("attributes") or {}
+        storage = attrs.get("storage") or attrs.get("hard_drive") or context.get("storage")
+        if storage:
+            return f"{name} has {storage} of storage."
+
+    # Screen / display
+    if any(w in q for w in ("screen", "display", "inch", "resolution")):
+        attrs = context.get("attributes") or {}
+        screen = attrs.get("screen_size") or attrs.get("display") or context.get("screen_size")
+        if screen:
+            return f"{name} has a {screen} display."
+
+    # Rating
+    if any(w in q for w in ("rating", "review", "rated", "score")):
+        rating = context.get("rating")
+        count = context.get("rating_count")
+        if rating:
+            cnt_str = f" across {count} reviews" if count else ""
+            return f"{name} is rated {rating}/5{cnt_str}."
+
+    # Warranty / return
+    if "warranty" in q:
+        w = context.get("warranty")
+        if w:
+            return f"Warranty: {w}"
+    if "return" in q:
+        r = context.get("return_policy")
+        if r:
+            return f"Return policy: {r}"
+
+    # Brand
+    if any(w in q for w in ("brand", "manufacturer", "made by", "who makes", "company")):
+        brand = context.get("brand")
+        if brand:
+            return f"{name} is made by {brand}."
+
+    # Generic fallback
+    specs = []
+    attrs = context.get("attributes") or {}
+    for key in ("ram", "storage", "processor", "cpu", "screen_size", "battery"):
+        val = attrs.get(key) or context.get(key)
+        if val:
+            specs.append(f"{key.replace('_', ' ').title()}: {val}")
+    if specs:
+        return f"Here's what I know about {name}: " + ", ".join(specs[:4]) + "."
+
+    return (
+        f"I don't have enough detail to answer that specific question about {name} right now. "
+        "Try checking the product listing for full specifications."
+    )
+
+
 @app.post("/product-qa", response_model=ProductQAResponse)
 async def product_qa(request: ProductQARequest):
     """Answer a question about a specific product using its data as LLM context.
@@ -944,7 +1039,8 @@ async def product_qa(request: ProductQARequest):
         answer = resp.choices[0].message.content or "I couldn't generate a response."
     except Exception as exc:
         logger.error("product_qa_failed %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to generate answer")
+        # Graceful fallback: extract answer directly from product context fields
+        answer = _product_qa_fallback(request.question, context)
 
     return ProductQAResponse(answer=answer)
 
