@@ -451,18 +451,18 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
         "laptop", "computer", "mac", "macbook", "thinkpad", "xps", "book", "phone",
         "hp", "dell", "asus", "lenovo", "acer", "apple", "samsung", "microsoft", "razer",
     )
-    # _compare_first_vs: explicit "X vs Y" — immediately compare after search.
-    # Excludes " or the " which is vaguer (e.g. "a Mac or the Dell").
+    # _compare_first_vs: detect "X vs Y" or "compare X [and/with/abd/...] Y".
+    # Exact parsing of the two products and focus features is done by the LLM in
+    # run_search_for_session — this is just a coarse yes/no trigger.
     _compare_first_vs = (
         not session.active_domain
-        and any(pat in msg_lower for pat in (" vs ", " versus ", " vs.", " compared to "))
         and any(hint in msg_lower for hint in _DOMAIN_HINTS)
+        and (
+            any(pat in msg_lower for pat in (" vs ", " versus ", " vs.", " compared to "))
+            or (msg_lower.startswith("compare ") and len(msg_lower) > 12)
+        )
     )
-    if (
-        not session.active_domain
-        and any(pat in msg_lower for pat in _VS_PATS)
-        and any(hint in msg_lower for hint in _DOMAIN_HINTS)
-    ):
+    if _compare_first_vs:
         agent.max_questions = 0
         logger.info("compare_first_detected", "Skipping interview for compare-first query", {
             "msg": msg_lower[:80], "will_auto_compare": _compare_first_vs
@@ -1146,8 +1146,10 @@ async def _handle_post_recommendation(
     _FAST_SEE_SIMILAR_KWS = (
         "see similar", "similar items", "show me similar",
         "similar laptops", "similar products",
+        "something similar", "similar to",  # "show me something similar to the best pick"
     )
-    if any(kw in msg_lower for kw in _FAST_BEST_VALUE_KWS):
+    # Guard: don't intercept for best-value when the message is really a see-similar request
+    if any(kw in msg_lower for kw in _FAST_BEST_VALUE_KWS) and "similar" not in msg_lower:
         intent = "best_value"
     elif any(kw in msg_lower for kw in _FAST_PROS_CONS_KWS):
         intent = "pros_cons"
@@ -1925,7 +1927,7 @@ async def _handle_post_recommendation(
             question_count=session.question_count, agent=agent,
         )
 
-    if "see similar" in msg_lower or "similar items" in msg_lower:
+    if any(kw in msg_lower for kw in _FAST_SEE_SIMILAR_KWS):
         session_manager.add_message(session_id, "user", request.message)
         # Directly show diverse results.
         # IMPORTANT: only keep the price range — drop all strict spec filters
@@ -2540,115 +2542,151 @@ async def _search_and_respond_ecommerce(
     session_manager.set_last_recommendation_data(session_id, flat_data)
 
     # ── Compare-first: dual-brand search + immediate comparison ─────────────
-    # "MacBook Air vs Dell XPS" → search each side independently so we get one
-    # product per side, then call generate_comparison_narrative on the pair.
-    # Without this, the agent's single-brand extraction returns only one brand's
-    # products and the comparison is meaningless (same-brand laptops vs each other).
+    # "MacBook Air vs Dell XPS" → search each side independently, then compare.
+    # Structured in nested try blocks so a narrative LLM failure NEVER causes
+    # a silent fallthrough to generic recommendations.
     if compare_first and original_message:
-        try:
-            # Map common product keywords → canonical brand names used in the DB
-            _CF_BRAND_MAP = {
-                "macbook": "Apple", "mac book": "Apple", "apple": "Apple",
-                "dell": "Dell", "xps": "Dell", "inspiron": "Dell", "alienware": "Dell",
-                "thinkpad": "Lenovo", "ideapad": "Lenovo", "legion": "Lenovo", "lenovo": "Lenovo",
-                "hp": "HP", "envy": "HP", "spectre": "HP", "pavilion": "HP", "omen": "HP",
-                "asus": "ASUS", "zenbook": "ASUS", "vivobook": "ASUS", "rog": "ASUS",
-                "acer": "Acer", "aspire": "Acer", "nitro": "Acer", "swift": "Acer",
-                "microsoft": "Microsoft", "surface": "Microsoft",
-                "samsung": "Samsung", "galaxy": "Samsung",
-                "lg": "LG", "gram": "LG",
-                "razer": "Razer", "blade": "Razer",
-                "msi": "MSI",
+        # Shared state — set by the parse step, consumed by the render step
+        _compare_products: list = []
+        _focus_features: Optional[str] = None
+        _not_found_note: str = ""
+
+        # Brand-keyword map (same as before)
+        _CF_BRAND_MAP = {
+            "macbook": "Apple", "mac book": "Apple", "apple": "Apple",
+            "dell": "Dell", "xps": "Dell", "inspiron": "Dell", "alienware": "Dell",
+            "thinkpad": "Lenovo", "ideapad": "Lenovo", "legion": "Lenovo", "lenovo": "Lenovo",
+            "hp": "HP", "envy": "HP", "spectre": "HP", "pavilion": "HP", "omen": "HP",
+            "victus": "HP", "omnibook": "HP",
+            "asus": "ASUS", "zenbook": "ASUS", "vivobook": "ASUS", "rog": "ASUS",
+            "acer": "Acer", "aspire": "Acer", "nitro": "Acer", "swift": "Acer",
+            "microsoft": "Microsoft", "surface": "Microsoft",
+            "samsung": "Samsung", "galaxy": "Samsung",
+            "lg": "LG", "gram": "LG",
+            "razer": "Razer", "blade": "Razer",
+            "msi": "MSI",
+        }
+
+        def _detect_brand(text: str) -> Optional[str]:
+            tl = text.lower()
+            for kw, brand in _CF_BRAND_MAP.items():
+                if kw in tl:
+                    return brand
+            return None
+
+        def _model_keyword(product_name: str, brand_name: str) -> str:
+            """
+            Extract the most distinctive model word, e.g.:
+              "HP OmniBook 7 Flip 16" → "OmniBook"
+              "HP Victus Gaming Laptop" → "Victus"
+            """
+            _GENERIC = {
+                "laptop", "gaming", "notebook", "computer", "2-in-1", "flip",
+                "convertible", "touch", "touchscreen", "series", "edition",
+                "book", "slim", "ultra", "plus", "pro", "max", "air",
             }
+            text = product_name
+            for bword in brand_name.split():
+                text = re.sub(r'(?i)\b' + re.escape(bword) + r'\b', '', text).strip()
+            for word in text.split():
+                w = word.lower().strip('",.-()[]')
+                if len(w) >= 4 and w not in _GENERIC and not w.isdigit():
+                    return word
+            return text.split()[0] if text.split() else product_name
 
-            def _detect_brand(text: str) -> Optional[str]:
-                tl = text.lower()
-                for kw, brand in _CF_BRAND_MAP.items():
-                    if kw in tl:
-                        return brand
-                return None
+        # ── Step 1: Parse query and search for specific products ──────────────
+        try:
+            from agent.comparison_agent import parse_compare_query as _pcq
+            _parsed = await _pcq(original_message)
+            _left_query = (_parsed.get("left") or "").strip()
+            _right_query = (_parsed.get("right") or "").strip()
+            _focus_features = _parsed.get("focus_features") or None
 
-            # Split "MacBook Air vs Dell XPS" → ["MacBook Air", "Dell XPS"]
-            _cf_sep = None
-            for _sep in (" vs ", " versus ", " vs.", " compared to "):
-                if _sep in original_message.lower():
-                    _cf_sep = _sep
-                    break
-            _cf_parts = re.split(_cf_sep or " vs ", original_message, maxsplit=1, flags=re.IGNORECASE) if _cf_sep else []
+            if _left_query and _right_query:
+                left_brand = _detect_brand(_left_query)
+                right_brand = _detect_brand(_right_query)
 
-            if len(_cf_parts) == 2:
-                left_text, right_text = _cf_parts[0].strip(), _cf_parts[1].strip()
-                left_brand = _detect_brand(left_text)
-                right_brand = _detect_brand(right_text)
-
-                # Only proceed with dual-search if we identified at least one brand per side
-                if left_brand and right_brand and left_brand != right_brand:
+                if left_brand and right_brand:
                     from app.tools.supabase_product_store import get_product_store as _gps
                     _store = _gps()
-                    _base = {k: v for k, v in search_filters.items() if k not in ("brand", "query")}
+                    _base = {k: v for k, v in search_filters.items()
+                             if k not in ("brand", "query", "title_search")}
 
-                    _left_results = _store.search_products({**_base, "brand": left_brand, "query": left_text}, limit=3)
-                    _right_results = _store.search_products({**_base, "brand": right_brand, "query": right_text}, limit=3)
+                    _left_kw = _model_keyword(_left_query, left_brand)
+                    _right_kw = _model_keyword(_right_query, right_brand)
+                    logger.info("compare_first_keywords",
+                                f"Model keywords: '{_left_kw}' vs '{_right_kw}'", {})
 
-                    if _left_results and _right_results:
-                        # Take best 2 from each side for a focused comparison
-                        _compare_products = _left_results[:2] + _right_results[:2]
-                        # Update session with the dual-brand products
-                        _all_ids = [str(p.get("product_id") or p.get("id") or "") for p in _compare_products]
-                        session_manager.set_last_recommendations(session_id, [x for x in _all_ids if x])
-                        session_manager.set_last_recommendation_data(session_id, _compare_products)
+                    # Title search → specific model; brand fallback → closest match
+                    _lr = _store.search_products({**_base, "brand": left_brand, "title_search": _left_kw}, limit=3)
+                    _rr = _store.search_products({**_base, "brand": right_brand, "title_search": _right_kw}, limit=3)
 
-                        from agent.comparison_agent import generate_comparison_narrative
-                        narrative, _, _ = await generate_comparison_narrative(
-                            _compare_products, original_message, domain
-                        )
-                        from app.formatters import format_product
-                        fmt_domain = "books" if domain == "books" else domain
-                        formatted = [
-                            format_product(p, fmt_domain).model_dump(mode="json", exclude_none=True)
-                            for p in _compare_products
-                        ]
-                        logger.info("compare_first_dual_search", f"Dual-brand compare: {left_brand} vs {right_brand} → {len(formatted)} products", {})
-                        return ChatResponse(
-                            response_type="recommendations",
-                            message=narrative,
-                            session_id=session_id,
-                            quick_replies=["Show me the best value", "See similar items", "Refine search"],
-                            recommendations=[formatted] if formatted else [],
-                            bucket_labels=["Compared Items"] if formatted else [],
-                            filters=search_filters,
-                            preferences={},
-                            question_count=question_count,
-                            domain=domain,
+                    _missing: list = []
+                    if not _lr:
+                        _missing.append(f'"{_left_query}"')
+                        _lr = _store.search_products({**_base, "brand": left_brand}, limit=3)
+                    if not _rr:
+                        _missing.append(f'"{_right_query}"')
+                        _rr = _store.search_products({**_base, "brand": right_brand}, limit=3)
+
+                    if _missing:
+                        _brand_label = left_brand or right_brand
+                        _not_found_note = (
+                            f"⚠️ {' and '.join(_missing)} weren't found in our catalog. "
+                            f"Showing the closest {_brand_label} matches instead:\n\n"
                         )
 
-            # Fallback: use flat_data from the main search (single-brand or mixed)
-            if flat_data:
+                    if _lr and _rr:
+                        _compare_products = _lr[:1] + _rr[:1]
+
+        except Exception as _parse_err:
+            logger.error("compare_first_parse_failed", str(_parse_err), {})
+
+        # If parse/search yielded nothing, fall back to top 2 from the main search
+        if not _compare_products and flat_data:
+            _compare_products = flat_data[:2]
+            _not_found_note = ""
+
+        # ── Step 2: Always render a comparison (LLM narrative or plain fallback) ──
+        if _compare_products:
+            # Update session so follow-up questions work against these 2 products
+            _cf_ids = [str(p.get("product_id") or p.get("id") or "") for p in _compare_products]
+            session_manager.set_last_recommendations(session_id, [x for x in _cf_ids if x])
+            session_manager.set_last_recommendation_data(session_id, _compare_products)
+
+            # Try LLM narrative; if it fails use the no-LLM structured fallback
+            try:
                 from agent.comparison_agent import generate_comparison_narrative
                 narrative, _, _ = await generate_comparison_narrative(
-                    flat_data[:6], original_message or "compare these", domain
+                    _compare_products, original_message, domain,
+                    focus_features=_focus_features,
                 )
-                from app.formatters import format_product
-                fmt_domain = "books" if domain == "books" else domain
-                formatted = [
-                    format_product(p, fmt_domain).model_dump(mode="json", exclude_none=True)
-                    for p in flat_data[:6]
-                ]
-                return ChatResponse(
-                    response_type="recommendations",
-                    message=narrative,
-                    session_id=session_id,
-                    quick_replies=["Show me the best value", "See similar items", "Refine search"],
-                    recommendations=[formatted] if formatted else [],
-                    bucket_labels=["Compared Items"] if formatted else [],
-                    filters=search_filters,
-                    preferences={},
-                    question_count=question_count,
-                    domain=domain,
-                )
-        except Exception as _ce:
-            logger.error("compare_first_narrative_failed", str(_ce), {})
-            # Fall through to normal recommendations on error
+            except Exception as _narr_err:
+                logger.error("compare_first_narrative_failed", str(_narr_err), {})
+                from agent.comparison_agent import _fallback_comparison
+                narrative = _fallback_comparison(_compare_products, domain)
+
+            from app.formatters import format_product
+            fmt_domain = "books" if domain == "books" else domain
+            formatted = [
+                format_product(p, fmt_domain).model_dump(mode="json", exclude_none=True)
+                for p in _compare_products
+            ]
+            logger.info("compare_first_result",
+                        f"Compare-first: {len(formatted)} products, note={bool(_not_found_note)}", {})
+            return ChatResponse(
+                response_type="recommendations",
+                message=_not_found_note + narrative,
+                session_id=session_id,
+                quick_replies=["Show me the best value", "See similar items", "Refine search"],
+                recommendations=[formatted] if formatted else [],
+                bucket_labels=["Compared Items"] if formatted else [],
+                filters=search_filters,
+                preferences={},
+                question_count=question_count,
+                domain=domain,
+            )
+        # _compare_products still empty (flat_data also empty) — fall through to normal recs
 
     # ── Brand-relaxation disclosure ───────────────────────────────────────────
     # If the user requested a specific brand but none of the returned products

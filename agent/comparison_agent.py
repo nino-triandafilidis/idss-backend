@@ -42,6 +42,74 @@ _REFINE_KEYWORDS = {
 }
 
 
+async def parse_compare_query(message: str) -> Dict[str, Any]:
+    """
+    LLM-based parser for any compare phrasing.
+    Handles: "X vs Y", "compare X and Y", "compare X abd Y for Z",
+             "X compared to Y focusing on Z", "compare X with Y in terms of Z", etc.
+
+    Returns {"left": str, "right": str, "focus_features": str | None}
+    Falls back to simple regex if the LLM call fails.
+    """
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI()
+
+        completion = await client.chat.completions.create(
+            model=OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            **_REASONING_KWARGS,
+            messages=[
+                {"role": "system", "content": (
+                    "Extract the two products being compared and any specific features the user wants to focus on.\n"
+                    "Return JSON with exactly three keys:\n"
+                    "  'left': first product name (string, clean — no feature qualifiers)\n"
+                    "  'right': second product name (string, clean — no feature qualifiers)\n"
+                    "  'focus_features': the dimensions to compare (string) or null if none specified\n\n"
+                    "Handle all phrasings and typos:\n"
+                    '  "compare MacBook Air and Dell XPS" → {"left":"MacBook Air","right":"Dell XPS","focus_features":null}\n'
+                    '  "compare HP OmniBook 7 Flip abd HP Victus based on price and storage" → {"left":"HP OmniBook 7 Flip","right":"HP Victus","focus_features":"price and storage"}\n'
+                    '  "MacBook Air vs Dell XPS for battery life and display" → {"left":"MacBook Air","right":"Dell XPS","focus_features":"battery life and display"}\n'
+                    '  "compare iPhone 15 with Samsung S24 in terms of camera" → {"left":"iPhone 15","right":"Samsung S24","focus_features":"camera"}\n'
+                    "Do NOT include feature phrases ('based on', 'for', 'focusing on') in the product names."
+                )},
+                {"role": "user", "content": message},
+            ],
+            max_completion_tokens=80,
+        )
+        data = json.loads(completion.choices[0].message.content)
+        # Validate — both sides must be non-empty
+        if data.get("left") and data.get("right"):
+            return data
+        raise ValueError("LLM returned empty left or right")
+
+    except Exception as e:
+        logger.warning(f"parse_compare_query LLM failed, using regex fallback: {e}")
+        # Regex fallback — handles the common separators.
+        # IMPORTANT: " abd " (typo for "and") must come before " and " so that
+        # "X abd Y based on price and storage" doesn't split at "price AND storage".
+        msg_lower = message.lower()
+        for sep in (" vs ", " versus ", " vs.", " compared to ", " abd ", " and "):
+            if sep in msg_lower:
+                idx = msg_lower.index(sep)
+                left = re.sub(r'^compare\s+', '', message[:idx], flags=re.IGNORECASE).strip()
+                right = message[idx + len(sep):].strip()
+                # Guard: if right side is < 2 words it's a feature word, not a product name.
+                # Skip this separator and try the next one.
+                if len(right.split()) < 2:
+                    continue
+                # Extract focus features from right side
+                focus_m = re.search(
+                    r'\s+(?:based on|for|with|focusing on|in terms of)\s+(.+?)$',
+                    right, re.IGNORECASE
+                )
+                focus = focus_m.group(1).strip() if focus_m else None
+                if focus_m:
+                    right = right[:focus_m.start()].strip()
+                return {"left": left, "right": right, "focus_features": focus}
+        return {"left": message, "right": "", "focus_features": None}
+
+
 async def detect_post_rec_intent(message: str) -> str:
     """
     LLM-based intent detection for post-recommendation messages.
@@ -203,6 +271,7 @@ async def generate_comparison_narrative(
     user_message: str,
     domain: str,
     mode: str = "compare",
+    focus_features: Optional[str] = None,
 ) -> str:
     """
     Generate a rich Markdown narrative for the given products.
@@ -300,16 +369,33 @@ async def generate_comparison_narrative(
                     # Inference-based fallback — always produce 3-4 useful bullets even
                     # when the DB has no specs (e.g. modular/niche laptops like Framework).
                     fallback_lines: List[str] = []
+                    _asking_battery = "battery" in user_message.lower()
+                    name_lower = name.lower()
+
                     for lbl, k in [("CPU", "processor"), ("RAM", "ram"),
                                    ("Storage", "storage"), ("GPU", "gpu"),
                                    ("Battery", "battery_life")]:
                         if p.get(k):
                             fallback_lines.append(f"{lbl}: {p[k]}")
+
+                    # Battery inference — when user asks about battery and no data is in DB,
+                    # infer from product name/OS so the answer stays on-topic.
+                    if _asking_battery and not p.get("battery_life"):
+                        if "chromebook" in name_lower:
+                            fallback_lines.append("Battery: ~10–12 hrs typical (ChromeOS is very power-efficient)")
+                        elif any(k in name_lower for k in ("stream", "celeron", "n4020", "n4000")):
+                            fallback_lines.append("Battery: ~8–10 hrs typical (efficient low-power Celeron)")
+                        elif any(k in name_lower for k in ("ryzen", "amd")):
+                            fallback_lines.append("Battery: ~6–9 hrs typical (varies by workload)")
+                        elif any(k in name_lower for k in ("macbook", "apple m")):
+                            fallback_lines.append("Battery: 15–18 hrs (Apple Silicon is industry-leading)")
+                        else:
+                            fallback_lines.append("Battery: Not listed — check manufacturer spec sheet")
+
                     # Always add price context
                     if price_str:
                         fallback_lines.append(f"Price: {price_str}")
                     # Infer from product name keywords when specs are empty
-                    name_lower = name.lower()
                     if not any(k in ("processor", "ram") and p.get(k) for k in ("processor", "ram")):
                         if "framework" in name_lower:
                             fallback_lines += [
@@ -318,7 +404,7 @@ async def generate_comparison_narrative(
                             ]
                         if "gaming" in name_lower or "rog" in name_lower or "strix" in name_lower:
                             fallback_lines.append("Gaming-grade GPU for high-frame-rate play")
-                        if "chromebook" in name_lower:
+                        if "chromebook" in name_lower and not _asking_battery:
                             fallback_lines += ["ChromeOS — lightweight and cloud-first",
                                                "Long battery life, fanless design"]
                         if "macbook" in name_lower or "apple" in (p.get("brand") or "").lower():
@@ -351,6 +437,13 @@ async def generate_comparison_narrative(
         # Default compare mode — single call, structured JSON with spec table
         # -----------------------------------------------------------------------
         spec_sheet = _build_spec_sheet(products, domain)
+
+        _focus_instruction = (
+            f"\n\nCRITICAL: The user ONLY wants to compare: {focus_features}. "
+            f"Show ONLY these dimensions in the narrative for each product. "
+            f"Do NOT mention any other specs (no CPU, RAM, GPU, display, battery, etc.)."
+        ) if focus_features else ""
+
         system_prompt = (
             "You are a helpful product advisor. Compare the recommended products based strictly on what the user asked.\n\n"
             "OUTPUT: Valid JSON with exactly three keys:\n"
@@ -368,6 +461,7 @@ async def generate_comparison_narrative(
             "- NEVER include UUIDs or internal IDs in the narrative. Only use product name/brand.\n"
             "- Keep each insight 1–2 sentences, specific, and directly relevant to the user's question.\n"
             "- selected_ids MUST be the exact PRODUCT_ID values from the spec sheet (the UUID strings after 'PRODUCT_ID:').\n"
+            + _focus_instruction
         )
 
         user_prompt = (
@@ -515,15 +609,60 @@ async def generate_targeted_answer(
 
     except Exception as e:
         logger.error(f"generate_targeted_answer failed: {e}")
-        # Minimal fallback: just return the top-rated product
+        msg_lower = user_message.lower()
+
+        # Helper: extract RAM GB from flat product dict
+        def _get_ram_gb(p: Dict[str, Any]) -> int:
+            raw = p.get("ram") or (p.get("attributes") or {}).get("ram_gb") or ""
+            try:
+                return int(float(str(raw).lower().replace("gb", "").strip().split()[0]))
+            except (ValueError, IndexError, AttributeError):
+                return 0
+
+        # ── Conceptual RAM / memory question ───────────────────────────────
+        _is_ram_conceptual = (
+            any(kw in msg_lower for kw in ("real-world difference", "real world difference", "difference between"))
+            and any(kw in msg_lower for kw in ("ram", "memory", "4gb", "8gb", "16gb", "gb"))
+        )
+        if _is_ram_conceptual:
+            four_prods = [p for p in products if 0 < _get_ram_gb(p) <= 4]
+            eight_prods = [p for p in products if _get_ram_gb(p) >= 8]
+            body = (
+                "**4GB vs 8GB RAM — Real-World Impact:**\n\n"
+                "- **4GB**: Handles basic web browsing, email, Google Docs, and ChromeOS cloud tasks. "
+                "Struggles with 10+ browser tabs, Office + Zoom open simultaneously, or any "
+                "Windows 11 multitasking — expect slowdowns.\n"
+                "- **8GB**: The minimum recommended for Windows 11 today. Comfortably handles "
+                "everyday multitasking — 20+ browser tabs, Office, video calls, music streaming — "
+                "without slowdowns. Future-proof for at least 3–4 years.\n\n"
+            )
+            if four_prods or eight_prods:
+                body += "**In your current results:**\n"
+                for p in four_prods[:2]:
+                    n = (p.get("name") or "")[:65]
+                    pr = f"${p['price']:,}" if p.get("price") else "N/A"
+                    body += f"- **{n}** ({pr}) — 4 GB: fine for ChromeOS/cloud, limited on Windows\n"
+                for p in eight_prods[:2]:
+                    n = (p.get("name") or "")[:65]
+                    pr = f"${p['price']:,}" if p.get("price") else "N/A"
+                    body += f"- **{n}** ({pr}) — 8 GB: solid everyday multitasking\n"
+            illustrate = (four_prods[:1] + eight_prods[:1]) or products[:2]
+            return (
+                body,
+                [str(p.get("id") or p.get("product_id", "")) for p in illustrate],
+                [p.get("name", "") for p in illustrate],
+            )
+
+        # ── Generic fallback: highest-rated with honest context ─────────────
         best = max(products, key=lambda p: float(p.get("rating") or 0), default=None)
         if best:
             name = best.get("name", "Top pick")
             price = best.get("price")
             price_str = f"${price:,.0f}" if price else ""
+            rating = float(best.get("rating") or 0)
             fb = f"**{name}**" + (f" — {price_str}" if price_str else "")
-            fb += f"\n• Highest-rated option in your results ({float(best.get('rating') or 0):.1f} ★)"
-            fb += f"\n\nBest pick: {name} based on overall user ratings."
+            fb += f"\n• Highest-rated in your results ({rating:.1f} ★)"
+            fb += f"\n\nBest pick: **{name}** — top user satisfaction score among current results."
             return fb, [str(best.get("id") or best.get("product_id", ""))], [name]
         return "I couldn't determine a winner from the current results.", [], []
 

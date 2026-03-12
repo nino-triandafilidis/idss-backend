@@ -260,6 +260,12 @@ class SupabaseProductStore:
         if brand and not drop_brand and str(brand).lower() not in ("no preference", "any", "", "null"):
             params.append(("brand", f"ilike.*{brand}*"))
 
+        # Title/name text search — used by compare-first to find specific product models
+        # e.g. title_search="OmniBook" finds HP OmniBook 7 Flip 16 specifically.
+        title_search = filters.get("title_search")
+        if title_search:
+            params.append(("title", f"ilike.*{title_search}*"))
+
         # Brand EXCLUSIONS — always applied regardless of drop_brand / relaxation step.
         # "excluded_brands" is a list like ["HP", "Acer"] from the agent.
         excluded_brands = filters.get("excluded_brands")
@@ -724,6 +730,12 @@ class _SQLAlchemyProductStore:
         if brand:
             conditions.append("brand ILIKE :brand")
             params["brand"] = f"%{brand}%"
+
+        # Title/name text search — used by compare-first to find specific product models
+        title_search = filters.get("title_search")
+        if title_search:
+            conditions.append("title ILIKE :title_search")
+            params["title_search"] = f"%{title_search}%"
 
         # Brand EXCLUSIONS — always applied, never dropped during relaxation.
         excluded_brands = filters.get("excluded_brands")
