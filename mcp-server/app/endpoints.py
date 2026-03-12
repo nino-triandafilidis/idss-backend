@@ -1886,7 +1886,9 @@ async def search_products(
             db_query = q2
             total_count = count2
             relaxed = count2 > 0
-            dropped_filters = [k for k in req_f.keys() if k not in ("category", "price_min_cents", "price_max_cents", "price_min", "price_max", "min_ram_gb", "min_storage_gb", "min_screen_inches", "min_battery_hours", "min_year")]
+            # min_battery_hours excluded from hard constraints: only 0.16% of products have battery data,
+            # so keeping it would return 0 results. It gets dropped during relaxation like soft constraints.
+            dropped_filters = [k for k in req_f.keys() if k not in ("category", "price_min_cents", "price_max_cents", "price_min", "price_max", "min_ram_gb", "min_storage_gb", "min_screen_inches", "min_year")]
             if relaxed:
                 relaxation_reason = f"No matches with your filters; showing {category_val} (dropped: {', '.join(dropped_filters) or 'query'})."
                 logger.info("relaxation_step", "Step 2 (spec-only) found results", {"count": count2, "dropped": dropped_filters})
