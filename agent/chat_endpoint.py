@@ -239,6 +239,16 @@ _POPULAR_QA: dict[str, tuple[str, list[str]]] = {
 _CACHE_STRIP_RE = re.compile(r"[^a-z0-9\s]")
 _CACHE_FILLER_RE = re.compile(r"\b(please|can you|could you|tell me|explain|what's|whats|i want to know)\b")
 
+# Specific-product lookup fast-path: matches model-number-like tokens.
+#   \b[A-Za-z]\d{1,4}\b  →  X1, M3, G16, i7, i9, T14, E15, H16
+#   \b\d{4,}\b            →  4070, 4090, 9530, 1000 (budget), 13700
+_MODEL_NUMBER_RE = re.compile(r"\b[A-Za-z]\d{1,4}\b|\b\d{4,}\b", re.IGNORECASE)
+
+# Compare-first trigger: any form of "compare / comparison / comparing / compared"
+# anywhere in the message (not just at the start).
+# Guards ("not session.active_domain" + domain hint) prevent mid-session false positives.
+_COMPARE_RE = re.compile(r"\bcompar\w*\b", re.IGNORECASE)
+
 
 def _normalize_for_cache(text: str) -> str:
     t = text.lower().strip()
@@ -448,8 +458,18 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
     # return a comparison response directly (no extra "compare" click needed).
     _VS_PATS = (" vs ", " versus ", " vs.", " v. ", " compared to ", " or the ")
     _DOMAIN_HINTS = (
-        "laptop", "computer", "mac", "macbook", "thinkpad", "xps", "book", "phone",
+        # Generic categories
+        "laptop", "computer", "mac", "macbook", "book", "phone",
+        # Brands
         "hp", "dell", "asus", "lenovo", "acer", "apple", "samsung", "microsoft", "razer",
+        "msi", "lg", "gigabyte", "framework",
+        # Named model families — specific enough to be a domain signal
+        "thinkpad", "ideapad", "yoga", "legion",            # Lenovo
+        "xps", "inspiron", "latitude", "alienware",          # Dell
+        "zenbook", "vivobook", "rog",                        # ASUS
+        "spectre", "envy", "pavilion", "omnibook",           # HP
+        "surface",                                           # Microsoft
+        "gram",                                              # LG
     )
     # _compare_first_vs: detect "X vs Y" or "compare X [and/with/abd/...] Y".
     # Exact parsing of the two products and focus features is done by the LLM in
@@ -459,13 +479,28 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
         and any(hint in msg_lower for hint in _DOMAIN_HINTS)
         and (
             any(pat in msg_lower for pat in (" vs ", " versus ", " vs.", " compared to "))
-            or (msg_lower.startswith("compare ") and len(msg_lower) > 12)
+            or bool(_COMPARE_RE.search(msg_lower))
         )
     )
     if _compare_first_vs:
         agent.max_questions = 0
         logger.info("compare_first_detected", "Skipping interview for compare-first query", {
             "msg": msg_lower[:80], "will_auto_compare": _compare_first_vs
+        })
+
+    # Specific-product lookup fast-path: first message has a domain hint AND a
+    # model-number-like token (X1, M3, 4070, $1000 budget, etc.) → skip interview.
+    _specific_lookup = (
+        not session.active_domain
+        and not _compare_first_vs
+        and any(hint in msg_lower for hint in _DOMAIN_HINTS)
+        and bool(_MODEL_NUMBER_RE.search(msg_lower))
+    )
+    if _specific_lookup:
+        agent.max_questions = 0
+        _tok = _MODEL_NUMBER_RE.search(msg_lower)
+        logger.info("specific_lookup_detected", "Skipping interview for specific-product query", {
+            "msg": msg_lower[:80], "matched_token": _tok.group(0) if _tok else "",
         })
 
     previous_domain = session.active_domain
