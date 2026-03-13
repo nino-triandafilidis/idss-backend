@@ -107,12 +107,14 @@
   {
     "query_id": "laptop_17",
     "query": "Looking for a laptop in the US for $500 or less (refurb/used OK) that can run Foundry VTT at recommended settings for Lancer/DnD. Prefers a 16-inch or larger screen and would like somewhat rugged build if possible. Linux compatibility is preferred but not required.",
-    "expected_ucp_match": 0.8571428571428571,
+    "expected_ucp_match": 0.5714285714285714,
     "produced_ucp": {
       "price_max_cents": 50000,
-      "os": "Linux",
-      "min_screen_size": 15.5,
-      "max_screen_size": 16.5,
+      "min_screen_size": 16.0,
+      "good_for_gaming": true,
+      "_soft_preferences": {
+        "use_case": "gaming"
+      },
       "category": "Electronics",
       "product_type": "laptop"
     },
@@ -159,7 +161,6 @@
     "expected_ucp_match": 0.8,
     "produced_ucp": {
       "price_max_cents": 35000,
-      "brand": "Microsoft",
       "category": "Electronics",
       "product_type": "laptop"
     },
@@ -280,6 +281,7 @@
       "_soft_preferences": {
         "use_case": "business"
       },
+      "brand": "Dell",
       "category": "Electronics",
       "product_type": "laptop"
     },

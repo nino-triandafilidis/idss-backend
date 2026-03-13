@@ -10,18 +10,18 @@ This report summarizes the **recommendation pipeline** evaluation: Shopping Agen
 - **Skipped (insufficient ground truth):** 38
 
 ### Shopping Agent (query→UCP)
-- **Mean UCP match rate:** 0.775
+- **Mean UCP match rate:** 0.751
 
 ### Baseline (query→UCP)
 - **Mean UCP match rate:** 0.556
 
 ### Merchant Agent (UCP→recs)
 - **Mean hard pass rate:** 0.083
-- **Mean similarity:** 0.592
+- **Mean similarity:** 0.588
 
 ### Baseline (recs)
-- **Mean hard pass rate:** 0.208
-- **Mean similarity:** 0.558
+- **Mean hard pass rate:** 0.158
+- **Mean similarity:** 0.567
 
 ---
 
@@ -30,6 +30,12 @@ This report summarizes the **recommendation pipeline** evaluation: Shopping Agen
 ### laptop_13
 
 **Query:** Looking for a new work laptop under $1,000 USD with strong battery life (at least 6 hours) and high reliability. Prefer ...
+
+**Expected UCP match:** 0.571
+
+### laptop_17
+
+**Query:** Looking for a laptop in the US for $500 or less (refurb/used OK) that can run Foundry VTT at recommended settings for La...
 
 **Expected UCP match:** 0.571
 
@@ -51,26 +57,20 @@ This report summarizes the **recommendation pipeline** evaluation: Shopping Agen
 
 **Expected UCP match:** 0.667
 
-### laptop_27
-
-**Query:** Looking for a basic, cheap laptop under $350 (USD) for web browsing, Microsoft Office, and reading PDFs. Performance and...
-
-**Expected UCP match:** 0.800
-
 ---
 
 ## Queries with zero hard pass rate (Merchant Agent)
 
 These queries had no recommended products satisfying all hard constraints from expected_ucp.
 
-- **laptop_1** — mean similarity: 0.644. "Need an HP laptop for everyday use under $650. Prefer a 15.6-inch touchscreen with at least 16GB RAM..."
-- **laptop_5** — mean similarity: 0.579. "Looking for a Windows laptop for a neuroscience/business student under $1200 with a ~14-inch matte, ..."
-- **laptop_7** — mean similarity: 0.601. "Need a portable ~14" laptop for an incoming biology major, with good battery life and a good keyboar..."
-- **laptop_13** — mean similarity: 0.588. "Looking for a new work laptop under $1,000 USD with strong battery life (at least 6 hours) and high ..."
-- **laptop_17** — mean similarity: 0.654. "Looking for a laptop in the US for $500 or less (refurb/used OK) that can run Foundry VTT at recomme..."
-- **laptop_18** — mean similarity: 0.552. "US aerospace engineering student with a ~$2000 budget wants a Windows 2-in-1 laptop with touchscreen..."
-- **laptop_40** — mean similarity: 0.546. "Need a Windows laptop for music production with some casual gaming. Prioritize overall performance a..."
-- **laptop_41** — mean similarity: 0.538. "Need a well-built laptop with great battery life for a Mechanical Engineering BCS, budget $1500–$200..."
+- **laptop_1** — mean similarity: 0.639. "Need an HP laptop for everyday use under $650. Prefer a 15.6-inch touchscreen with at least 16GB RAM..."
+- **laptop_5** — mean similarity: 0.583. "Looking for a Windows laptop for a neuroscience/business student under $1200 with a ~14-inch matte, ..."
+- **laptop_7** — mean similarity: 0.588. "Need a portable ~14" laptop for an incoming biology major, with good battery life and a good keyboar..."
+- **laptop_13** — mean similarity: 0.598. "Looking for a new work laptop under $1,000 USD with strong battery life (at least 6 hours) and high ..."
+- **laptop_17** — mean similarity: 0.603. "Looking for a laptop in the US for $500 or less (refurb/used OK) that can run Foundry VTT at recomme..."
+- **laptop_18** — mean similarity: 0.549. "US aerospace engineering student with a ~$2000 budget wants a Windows 2-in-1 laptop with touchscreen..."
+- **laptop_40** — mean similarity: 0.528. "Need a Windows laptop for music production with some casual gaming. Prioritize overall performance a..."
+- **laptop_41** — mean similarity: 0.535. "Need a well-built laptop with great battery life for a Mechanical Engineering BCS, budget $1500–$200..."
 
 ---
 
