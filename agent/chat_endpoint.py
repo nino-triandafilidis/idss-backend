@@ -2614,10 +2614,14 @@ async def _search_and_respond_ecommerce(
             Extract the most distinctive model word, e.g.:
               "HP OmniBook 7 Flip 16" → "OmniBook"
               "HP Victus Gaming Laptop" → "Victus"
+              "Apple laptops" → "" (no specific model — brand-only search)
+            Returns "" when no meaningful model keyword is found, so the caller
+            skips title_search and falls back to brand-only search.
             """
             _GENERIC = {
-                "laptop", "gaming", "notebook", "computer", "2-in-1", "flip",
-                "convertible", "touch", "touchscreen", "series", "edition",
+                "laptop", "laptops", "gaming", "notebook", "notebooks",
+                "computer", "computers", "2-in-1", "flip", "convertible",
+                "touch", "touchscreen", "series", "edition",
                 "book", "slim", "ultra", "plus", "pro", "max", "air",
             }
             text = product_name
@@ -2627,7 +2631,8 @@ async def _search_and_respond_ecommerce(
                 w = word.lower().strip('",.-()[]')
                 if len(w) >= 4 and w not in _GENERIC and not w.isdigit():
                     return word
-            return text.split()[0] if text.split() else product_name
+            # Fallback word is either generic or empty — signal no useful model keyword
+            return ""
 
         # ── Step 1: Parse query and search for specific products ──────────────
         try:
@@ -2652,9 +2657,14 @@ async def _search_and_respond_ecommerce(
                     logger.info("compare_first_keywords",
                                 f"Model keywords: '{_left_kw}' vs '{_right_kw}'", {})
 
-                    # Title search → specific model; brand fallback → closest match
-                    _lr = _store.search_products({**_base, "brand": left_brand, "title_search": _left_kw}, limit=3)
-                    _rr = _store.search_products({**_base, "brand": right_brand, "title_search": _right_kw}, limit=3)
+                    # Title search → specific model; omit title_search if no meaningful
+                    # keyword (e.g. "Apple laptops" → brand-only search, not title="laptops")
+                    _lr = _store.search_products(
+                        {**_base, "brand": left_brand, **( {"title_search": _left_kw} if _left_kw else {})},
+                        limit=3)
+                    _rr = _store.search_products(
+                        {**_base, "brand": right_brand, **( {"title_search": _right_kw} if _right_kw else {})},
+                        limit=3)
 
                     _missing: list = []
                     if not _lr:
