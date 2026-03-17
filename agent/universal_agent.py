@@ -1023,6 +1023,10 @@ class UniversalAgent:
             r'(?:under|below|less than|at most|up to|max|budget[:\s]+)\s*\$\s*(\d[\d,]*)',
             text, re.IGNORECASE
         )
+        _b_over = re.search(
+            r'(?:over|above|more than|at least|minimum|starting(?:\s+from)?|from)\s*\$\s*(\d[\d,]*)',
+            text, re.IGNORECASE
+        )
         _b_plain = re.search(r'\$\s*(\d[\d,]+)', text)
         # "500 bucks", "500 dollars", "500 usd" (without dollar sign)
         _b_bucks = re.search(
@@ -1036,7 +1040,9 @@ class UniversalAgent:
                 hi = str(int(hi) * 1000)
             budget_val = f"${lo}-${hi}"
         elif _b_under:
-            budget_val = f"${_b_under.group(1).replace(',', '')}"
+            budget_val = f"under{_b_under.group(1).replace(',', '')}"
+        elif _b_over:
+            budget_val = f"over{_b_over.group(1).replace(',', '')}"
         elif _b_plain:
             budget_val = f"${_b_plain.group(1).replace(',', '')}"
         elif _b_bucks:

@@ -97,6 +97,13 @@ EXTRACTION RULES:
 
 6. Only extract what is explicitly stated or clearly inferable. Do NOT guess.
 
+7. For budget, PRESERVE the direction keyword in the value string:
+   - "over $1000", "above $1000", "more than $1000", "at least $1000", "minimum $1000", "starting from $1000" → value="over1000"
+   - "under $1000", "below $1000", "less than $1000", "up to $1000", "max $1000" → value="under1000"
+   - "$1000-$2000", "between $1000 and $2000" → value="1000-2000"
+   - plain "$1000" (no direction word) → value="1000"
+   Examples: "dell computer over $1000" → budget="over1000" | "laptop under $500" → budget="under500"
+
 Also detect user intent signals:
 - is_impatient: true if user wants to skip questions ("just show me", "whatever", "skip", "I don't care")
 - wants_recommendations: true ONLY when the user EXPLICITLY asks for recommendations, OR provides ≥2 specific constraints (budget + one other, or brand + spec, etc.)
