@@ -25,7 +25,8 @@ Improves intent recognition for 3 existing intents where natural phrasings were 
 2. **Supabase credentials** — copy `.env.example` to `.env` and fill in:
    - `SUPABASE_URL` and `SUPABASE_KEY` (from Supabase dashboard → Settings → API)
    - `OPENAI_API_KEY`
-   - `DATABASE_URL` (PostgreSQL connection string)
+
+   > **Note:** Leave `DATABASE_URL` commented out. Supabase free-tier projects pause the direct Postgres connection (`db.*.supabase.co`) after inactivity. The backend automatically falls back to the Supabase REST API, which remains available.
 
    If setting up from scratch, see PR #21 README for full Supabase setup and seed instructions.
 
