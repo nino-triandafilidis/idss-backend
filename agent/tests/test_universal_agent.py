@@ -315,7 +315,12 @@ def test_use_case_downgrade_clears_performance_slots():
     """
     Scenario: user discussed gaming (use_case=gaming, gpu_tier set) then says
     'actually it's just for email and Netflix'.  Performance slots must clear.
+
+    Uses the shared _check_use_case_downgrade method — the same code path
+    that fires in both process_message and process_refinement.
     """
+    from agent.universal_agent import SlotValue
+
     agent = UniversalAgent(session_id="test-usecase-downgrade")
     agent.domain = "laptops"
     agent.filters = {
@@ -326,17 +331,18 @@ def test_use_case_downgrade_clears_performance_slots():
         "price_max_cents": 100000,
     }
 
-    _LIGHT_USE_CASES = {"email", "everyday", "basic", "general", "home", "school", "browsing"}
-    _HEAVY_USE_CASES = {"gaming", "machine learning", "ml", "video editing", "3d", "streaming"}
-    _prior_use_case = str(agent.filters.get("use_case") or "").lower()
-    new_use_case = "email"
-
-    if new_use_case.lower() in _LIGHT_USE_CASES and _prior_use_case in _HEAVY_USE_CASES:
-        for slot in {"min_ram_gb", "gpu_vendor", "gpu_tier", "refresh_rate_min_hz"}:
-            agent.filters.pop(slot, None)
+    prior_uc = str(agent.filters.get("use_case") or "")
+    # Simulate the merge having already updated use_case
+    agent.filters["use_case"] = "email"
+    agent._check_use_case_downgrade(
+        [SlotValue(slot_name="use_case", value="email")],
+        prior_uc,
+    )
 
     assert "gpu_tier" not in agent.filters, "gpu_tier persists after use_case downgrade"
     assert "refresh_rate_min_hz" not in agent.filters, "refresh_rate persists"
     assert "min_ram_gb" not in agent.filters, "min_ram_gb persists"
     # Budget preserved
     assert agent.filters.get("price_max_cents") == 100000
+    # use_case updated
+    assert agent.filters.get("use_case") == "email"

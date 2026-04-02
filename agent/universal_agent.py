@@ -625,34 +625,16 @@ class UniversalAgent:
             resp["timings_ms"] = timings
             return resp
 
+        # Capture prior use_case BEFORE extraction overwrites it.
+        _prior_use_case = str(self.filters.get("use_case") or "")
+
         t2 = time.perf_counter()
         extraction_result = self._extract_criteria(message, schema)
         timings["criteria_extraction_ms"] = (time.perf_counter() - t2) * 1000
 
-        # 2a. Use-case contradiction: if user shifts to a light/basic use case
-        # ("just email and Netflix", "nothing heavy") after having set performance-
-        # heavy slots from a prior gaming/ML use case, clear the derived hardware
-        # requirements so the new query isn't anchored to the old workload.
+        # 2a. Use-case downgrade: clear performance slots when shifting heavy → light.
         if extraction_result and extraction_result.criteria:
-            _new_use_case = next(
-                (c.value for c in extraction_result.criteria if c.slot_name == "use_case"),
-                None,
-            )
-            _LIGHT_USE_CASES = {"email", "everyday", "basic", "general", "home", "school", "browsing"}
-            _HEAVY_USE_CASES = {"gaming", "machine learning", "ml", "video editing", "3d", "streaming"}
-            _prior_use_case = str(self.filters.get("use_case") or "").lower()
-            if (
-                _new_use_case
-                and _new_use_case.lower() in _LIGHT_USE_CASES
-                and _prior_use_case in _HEAVY_USE_CASES
-            ):
-                _perf_slots = {"min_ram_gb", "gpu_vendor", "gpu_tier", "refresh_rate_min_hz"}
-                for _ps in _perf_slots:
-                    self.filters.pop(_ps, None)
-                logger.info(
-                    f"Use-case downgrade detected ({_prior_use_case!r} → {_new_use_case!r}); "
-                    f"cleared performance slots: {_perf_slots}"
-                )
+            self._check_use_case_downgrade(extraction_result.criteria, _prior_use_case)
 
         # 2b. Vagueness gate — bare "best laptop 2024" style queries must NOT jump
         # straight to recommendations even if the LLM set wants_recommendations=True.
@@ -928,6 +910,33 @@ class UniversalAgent:
         "good_for_web_dev", "good_for_ml",
         "use_case",
     })
+
+    _LIGHT_USE_CASES = frozenset({"email", "everyday", "basic", "general", "home", "school", "browsing"})
+    _HEAVY_USE_CASES = frozenset({"gaming", "machine learning", "ml", "video editing", "3d", "streaming"})
+    _PERF_SLOTS = frozenset({"min_ram_gb", "gpu_vendor", "gpu_tier", "refresh_rate_min_hz"})
+
+    def _check_use_case_downgrade(self, new_criteria: List["SlotValue"], prior_use_case: str) -> None:
+        """Clear performance slots when use-case shifts from heavy to light.
+
+        Must be called AFTER _normalize_and_merge_criteria.  *prior_use_case*
+        is the value from self.filters BEFORE the merge overwrote it.
+        """
+        new_use_case = next(
+            (c.value for c in new_criteria if c.slot_name == "use_case"),
+            None,
+        )
+        if not new_use_case:
+            return
+        if (
+            new_use_case.lower() in self._LIGHT_USE_CASES
+            and prior_use_case.lower() in self._HEAVY_USE_CASES
+        ):
+            for slot in self._PERF_SLOTS:
+                self.filters.pop(slot, None)
+            logger.info(
+                f"Use-case downgrade detected ({prior_use_case!r} → {new_use_case!r}); "
+                f"cleared performance slots: {self._PERF_SLOTS}"
+            )
 
     def _normalize_and_merge_criteria(
         self,
@@ -1724,8 +1733,10 @@ Write the recommendation message."""}
             logger.info(f"Refinement classification: intent={result.intent}, reasoning={result.reasoning}")
 
             if result.intent == "refine_filters":
+                _prior_uc = str(self.filters.get("use_case") or "")
                 schema = get_domain_schema(self.domain)
                 self._normalize_and_merge_criteria(result.updated_criteria, schema)
+                self._check_use_case_downgrade(result.updated_criteria, _prior_uc)
                 self.history.append({"role": "user", "content": message})
                 return self._handoff_to_search(schema)
 
@@ -1741,11 +1752,13 @@ Write the recommendation message."""}
 
             elif result.intent == "new_search":
                 # Clear all filters and apply new criteria
+                _prior_uc = str(self.filters.get("use_case") or "")
                 self.filters = {}
                 self.questions_asked = []
                 self.question_count = 0
                 schema = get_domain_schema(self.domain)
                 self._normalize_and_merge_criteria(result.updated_criteria, schema)
+                self._check_use_case_downgrade(result.updated_criteria, _prior_uc)
                 self.history.append({"role": "user", "content": message})
                 return self._handoff_to_search(schema)
 
