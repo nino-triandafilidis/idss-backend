@@ -1,42 +1,41 @@
 #!/usr/bin/env python3
 """
-Multi-Turn G-Eval Harness — 4-Way Fair Comparison
+Multi-Turn G-Eval Harness — 5-Way Fair Comparison
 ===================================================
-Tests IDSS, GPT-4o-mini (catalog-bound), Perplexity sonar (⚠ web-augmented, informational), and Sajjad's idss-mcp on 10 scripted
-3–5 turn conversation scenarios covering constraint accumulation, mind-changes,
-brand exclusion persistence, and preference tracking.
+Tests IDSS, GPT-4o-mini (catalog-bound), Gemini-2.0-flash (catalog-bound),
+Perplexity sonar (⚠ web-augmented, informational), and Sajjad's idss-mcp on 10
+scripted 3–5 turn conversation scenarios covering constraint accumulation,
+mind-changes, brand exclusion persistence, and preference tracking.
 
 Systems:
   IDSS        sequential /chat calls to live server (session state enforces constraints)
   Sajjad      same /chat API, different server (localhost:9003 by default)
   GPT         catalog-bound gpt-4o-mini — before EACH turn, searches the IDSS product
-              catalog via /api/search-products and injects top-10 results so GPT
-              recommends from the SAME product pool as IDSS (fair comparison).
-              Structured products are matched back from GPT's text for budget/brand checks.
+              catalog via /chat and injects top-10 results so GPT recommends from the
+              SAME product pool as IDSS (fair comparison).
+  Gemini      catalog-bound gemini-2.0-flash — same catalog injection design as GPT.
+              Uses GPT-4o-mini as judge (not Gemini) to avoid self-preference bias.
+              Uses role "model" (not "assistant") in conversation history per Gemini API.
   Perplexity  ⚠ sonar (web-augmented) — informational only. All Perplexity API
               models use live web search; no offline variant exists. Per mentor:
               "The baseline shouldn't use web search." Excluded from primary ranking.
 
 Fairness design (per mentor feedback — Negin Golrezaei + Hannah Clay):
   "If we don't give [GPT] our database, how can we even compare?" — answered by
-  catalog injection for GPT. Perplexity cannot be made fair (web search is
-  mandatory in their API). Primary fair comparison: IDSS vs GPT-catalog-bound vs Sajjad.
+  catalog injection for GPT and Gemini. Perplexity cannot be made fair (web search is
+  mandatory in their API). Primary fair comparison: IDSS vs GPT vs Gemini vs Sajjad.
 
-Scoring (v3 — catalog-bound GPT + judge-hallucination-resistant):
+Scoring (v3 — catalog-bound GPT/Gemini + judge-hallucination-resistant):
   45% judge       GPT-4o-mini evaluates full transcript; explicitly told not to penalize
-                  silent constraint enforcement (DB/search filtering)
+                  silent constraint enforcement (DB/search filtering).
+                  All systems judged by the SAME GPT-4o-mini judge for comparability.
   55% constraint  Deterministic checks: brand exclusions, brand presence, budget.
-                  GPT now has structured products from catalog matching.
-                  Text-based checks only for Perplexity (still no structured output).
-
-Key fix over v2:
-  GPT was comparing against its training data (hallucinated products, no real prices).
-  Now: GPT gets the actual IDSS catalog (same search results) before each turn.
-  This makes budget checks, brand exclusion checks, and quality scoring fair.
+                  GPT/Gemini have structured products from catalog matching.
+                  Text-based checks only for Perplexity (no structured output).
 
 Usage:
     python scripts/run_multiturn_geval.py --url http://localhost:8001
-    python scripts/run_multiturn_geval.py --systems idss,gpt,perplexity,sajjad
+    python scripts/run_multiturn_geval.py --systems idss,gpt,gemini,sajjad
     python scripts/run_multiturn_geval.py --systems idss,gpt --save scripts/geval_multiturn.json
     python scripts/run_multiturn_geval.py --scenario 1
     python scripts/run_multiturn_geval.py --sajjad-url http://otherhost:9003
@@ -64,6 +63,14 @@ except ImportError:
     print("ERROR: openai not installed.")
     sys.exit(1)
 
+# google-genai is optional — only required when --systems includes "gemini"
+try:
+    from google import genai as _genai_lib
+    from google.genai import types as _genai_types
+    _GEMINI_AVAILABLE = True
+except ImportError:
+    _GEMINI_AVAILABLE = False
+
 try:
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -75,6 +82,7 @@ GREEN = "\033[92m"; RED = "\033[91m"; YEL = "\033[93m"; CYN = "\033[96m"
 BOLD  = "\033[1m";  DIM = "\033[2m";  RST = "\033[0m"
 
 PASS_THRESHOLD = 0.5
+GEMINI_MODEL   = "gemini-2.5-flash"   # "mini" tier — comparable to gpt-4o-mini
 
 # ============================================================================
 # Scripted multi-turn scenarios
@@ -97,6 +105,15 @@ MULTITURN_SCENARIOS: List[Dict] = [
             "excluded_brands": ["HP"],
             "min_ram_gb": 16,
         },
+        # per_turn_constraints: specifies which hard constraints are active in each turn.
+        # Empty dict = no checkable hard constraint established yet for that turn.
+        # Used by check_constraint_drift_all_turns() to check EVERY turn, not just the last.
+        "per_turn_constraints": [
+            {},                                                          # turn 1 — "I need a laptop"
+            {},                                                          # turn 2 — gaming (qualitative, not checkable)
+            {"excluded_brands": ["HP"], "budget_max_usd": 1000},        # turn 3 — HP exclusion + $1000 stated
+            {"excluded_brands": ["HP"], "budget_max_usd": 1000},        # turn 4 — all prior constraints still active
+        ],
         "quality_note": (
             "User adds constraints across 4 turns: gaming → budget $1000 → no HP → 16GB RAM. "
             "Final recommendations MUST satisfy ALL four constraints. "
@@ -118,6 +135,12 @@ MULTITURN_SCENARIOS: List[Dict] = [
             "use_case": "video editing",
             "budget_max_usd": 1500,
         },
+        # Budget set only in turn 3; turns 1-2 have no checkable hard numerical constraint.
+        "per_turn_constraints": [
+            {},                          # turn 1 — gaming (qualitative, not budget/brand checkable)
+            {},                          # turn 2 — pivot (qualitative)
+            {"budget_max_usd": 1500},    # turn 3 — $1500 budget stated
+        ],
         "quality_note": (
             "User explicitly pivots from gaming to video editing in turn 2. "
             "Final recommendations must be for VIDEO EDITING, not gaming. "
@@ -138,6 +161,13 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "final_constraints": {
             "excluded_brands": ["Dell"],
         },
+        # Dell exclusion is active from turn 1 and must persist in EVERY subsequent turn.
+        # This is the key scenario for constraint drift — exclusion must not "fade out".
+        "per_turn_constraints": [
+            {"excluded_brands": ["Dell"]},    # turn 1 — Dell excluded immediately
+            {"excluded_brands": ["Dell"]},    # turn 2 — must still exclude Dell
+            {"excluded_brands": ["Dell"]},    # turn 3 — must still exclude Dell
+        ],
         "quality_note": (
             "Dell must be excluded from ALL turns, not just the first. "
             "Turn 2 should show GPU-capable laptops, still without Dell. "
@@ -159,6 +189,12 @@ MULTITURN_SCENARIOS: List[Dict] = [
             "use_case": "college/CS/coding",
             "budget_max_usd": 800,
         },
+        # Budget only established in turn 3.
+        "per_turn_constraints": [
+            {},                       # turn 1 — "laptop" (no constraints)
+            {},                       # turn 2 — CS use case (qualitative)
+            {"budget_max_usd": 800},  # turn 3 — $800 budget stated
+        ],
         "quality_note": (
             "Starting from a single word ('laptop'), system should ask a clarifying question, "
             "then progressively narrow to a CS student laptop under $800. "
@@ -179,6 +215,12 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "final_constraints": {
             "budget_max_usd": 1200,
         },
+        # Budget $1200 stated in turn 1 — should be active for all subsequent turns.
+        "per_turn_constraints": [
+            {"budget_max_usd": 1200},    # turn 1 — budget stated immediately
+            {"budget_max_usd": 1200},    # turn 2 — comparison (same pool, same budget)
+            {"budget_max_usd": 1200},    # turn 3 — follow-up Q (same products referenced)
+        ],
         "quality_note": (
             "Turn 1: system shows business laptop recommendations under $1200. "
             "Turn 2: system must compare the TOP TWO from turn 1 — without re-searching. "
@@ -200,6 +242,13 @@ MULTITURN_SCENARIOS: List[Dict] = [
             "budget_max_usd": 700,
             "use_case": "developer/Docker",
         },
+        # Budget $700 introduced in turn 2; must persist in turn 3.
+        # Turn 1 has no budget constraint (testing that unconstrained → constrained transition works).
+        "per_turn_constraints": [
+            {},                       # turn 1 — no budget set yet
+            {"budget_max_usd": 700},  # turn 2 — "$700" stated; refinement applies immediately
+            {"budget_max_usd": 700},  # turn 3 — Docker Q in context of <$700 options
+        ],
         "quality_note": (
             "After price refinement in turn 2, ALL recommendations must be under $700. "
             "Turn 3 should answer the Docker question in context of the <$700 options. "
@@ -220,6 +269,16 @@ MULTITURN_SCENARIOS: List[Dict] = [
             "brand_preference": "Apple/MacBook",
             "budget_max_usd": 1400,
         },
+        # Budget CHANGES: $1000 in turn 1 → overwritten to $1400 in turn 2.
+        # The drift check must use the CURRENT budget for each turn (no double-counting).
+        # A product priced at $1200 is fine in all turns: passes $1000*1.05=1050? No.
+        # Actually $1200 > $1000*1.05=$1050, so it FAILS turn 1 budget check.
+        # This tests that the budget update is correctly tracked turn-by-turn.
+        "per_turn_constraints": [
+            {"budget_max_usd": 1000},    # turn 1 — "$1000" stated
+            {"budget_max_usd": 1400},    # turn 2 — overwritten to "$1400"
+            {"budget_max_usd": 1400},    # turn 3 — $1400 still active
+        ],
         "quality_note": (
             "Budget must UPDATE to $1400 in turn 2, not accumulate ($1000-$1400 is wrong). "
             "MacBook/Apple preference must persist through all turns. "
@@ -239,6 +298,14 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "final_constraints": {
             "brand_preference": "HP",  # should APPEAR in final turn
         },
+        # HP exclusion active only in turn 1.
+        # After turn 2 (un-exclusion), HP constraint is cleared — no brand check applies.
+        # Turn 3: HP should be PRESENT (checked by check_final_brand_presence, not drift).
+        "per_turn_constraints": [
+            {"excluded_brands": ["HP"]},    # turn 1 — "no HP please"
+            {},                              # turn 2 — HP un-excluded, no constraint active
+            {},                              # turn 3 — HP preferred; drift check N/A
+        ],
         "quality_note": (
             "Turn 1: HP is excluded — no HP in recommendations. "
             "Turn 2: user reverses the exclusion — HP is now allowed. "
@@ -266,6 +333,16 @@ MULTITURN_SCENARIOS: List[Dict] = [
             "os": "Windows or macOS",
             "budget_max_usd": 600,
         },
+        # Budget $600 only set in turn 4; must hold in turn 5 (warranty Q).
+        # "No Chromebook" is a category exclusion, not a brand — not directly checkable
+        # by brand name match (Chromebooks don't have a single brand). Skip in drift.
+        "per_turn_constraints": [
+            {},                       # turn 1 — use case (qualitative)
+            {},                       # turn 2 — use case detail (qualitative)
+            {},                       # turn 3 — Chromebook exclusion (no brand check available)
+            {"budget_max_usd": 600},  # turn 4 — "$600" stated
+            {"budget_max_usd": 600},  # turn 5 — warranty Q; budget still applies to refs
+        ],
         "quality_note": (
             "5-turn session: med student → note-taking/PDF → no Chromebook/real OS → $600 max → warranty Q. "
             "System must accumulate ALL stated constraints. "
@@ -288,6 +365,14 @@ MULTITURN_SCENARIOS: List[Dict] = [
             "min_ram_gb": 16,
             "style": "professional (no gaming)",
         },
+        # Budget $1300 stated in turn 1 — must persist across all 3 turns.
+        # Many other constraints (weight, screen size, style) are qualitative — not checkable
+        # via product price/brand fields. Only budget is deterministically checkable here.
+        "per_turn_constraints": [
+            {"budget_max_usd": 1300},    # turn 1 — full dense spec stated, $1300 checkable
+            {"budget_max_usd": 1300},    # turn 2 — clarifying Q; budget still applies
+            {"budget_max_usd": 1300},    # turn 3 — refurbished ask; budget still applies
+        ],
         "quality_note": (
             "All first-turn constraints must persist: <4lbs, 13-14in, 16GB+, no gaming look, <$1300. "
             "Turn 2-3 clarify that refurbished is acceptable. "
@@ -545,6 +630,22 @@ IMPORTANT: When a CATALOG is provided below, you MUST recommend only from those
 listed products. Do NOT invent or hallucinate products not in the catalog.
 """
 
+# Independent copy for Gemini — same content ensures same playing field as GPT.
+# Kept as a separate constant (not imported) so both scripts remain self-contained.
+GEMINI_MULTITURN_SYSTEM = """\
+You are a helpful online shopping assistant specialising in laptops and computers.
+When the user describes what they need, give them 3–5 concrete product recommendations
+with a short reason for each. If the user's request is vague, ask ONE focused clarifying
+question.
+
+IMPORTANT: Track ALL preferences and constraints stated across the conversation.
+If the user updates a preference (e.g., raises budget, removes a brand exclusion),
+update your understanding — do not keep the old constraint.
+
+IMPORTANT: When a CATALOG is provided below, you MUST recommend only from those
+listed products. Do NOT invent or hallucinate products not in the catalog.
+"""
+
 
 async def run_gpt_scenario(
     oai:            AsyncOpenAI,
@@ -626,6 +727,112 @@ async def run_gpt_scenario(
             "response_type": rtype,
             "n_recs":        len(gpt_products),
             "products":      gpt_products,
+            "elapsed_s":     round(elapsed, 2),
+        })
+
+    return turn_results, time.perf_counter() - t_total
+
+
+# ============================================================================
+# Gemini multi-turn runner (catalog-bound, full context each turn)
+# ============================================================================
+
+async def run_gemini_scenario(
+    gemini_client: Any,   # google.genai.Client — passed in from run_all_scenarios
+    scenario:       Dict,
+    sem:            asyncio.Semaphore,
+    catalog_client: Optional[httpx.AsyncClient] = None,
+    idss_url:       str = "http://localhost:8001",
+) -> Tuple[List[Dict], float]:
+    """
+    Run a multi-turn scenario against Gemini-2.0-flash (catalog-bound, full context).
+
+    Mirrors run_gpt_scenario() exactly, with two Gemini-specific differences:
+      1. History uses role "model" instead of "assistant" (Gemini API convention).
+         Mixing "assistant" with "user" causes a 400 error from the Gemini API.
+      2. response.text can be None if the safety filter blocks the output — guarded
+         with `(response.text or "").strip()`.
+
+    Catalog injection follows the same design as GPT: before each turn, the IDSS
+    catalog is fetched and prepended to the system instruction so Gemini recommends
+    from the same product pool as IDSS. Products are matched back to catalog entries
+    for deterministic budget/brand constraint checks.
+    """
+    history:      List[Dict] = []   # user/model history (no catalog text; role="model" for Gemini)
+    turn_results: List[Dict] = []
+    accumulated_query = ""
+    t_total = time.perf_counter()
+
+    for turn_msg in scenario["turns"]:
+        accumulated_query = (accumulated_query + " " + turn_msg).strip()
+
+        # Search catalog fresh each turn (captures preference refinements)
+        catalog_products: List[Dict] = []
+        if catalog_client:
+            catalog_products = await search_catalog_for_gpt(
+                catalog_client, idss_url, accumulated_query, n=10
+            )
+
+        # Build system instruction: base + catalog snapshot
+        catalog_block = ""
+        if catalog_products:
+            catalog_block = (
+                "\n\nCATALOG — recommend ONLY from these products (do not invent others):\n"
+                + _format_catalog_for_gpt(catalog_products)
+            )
+        system_instruction = GEMINI_MULTITURN_SYSTEM + catalog_block
+
+        # Build multi-turn contents list.
+        # Gemini requires role "model" for assistant turns — NOT "assistant" (OpenAI convention).
+        contents = []
+        for msg in history:
+            contents.append({"role": msg["role"], "parts": [{"text": msg["content"]}]})
+        contents.append({"role": "user", "parts": [{"text": turn_msg}]})
+
+        t0 = time.perf_counter()
+        async with sem:
+            reply = "[ERROR: not attempted]"
+            for attempt in range(3):
+                try:
+                    response = await gemini_client.aio.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=contents,
+                        config=_genai_types.GenerateContentConfig(
+                            system_instruction=system_instruction,
+                            temperature=0.3,
+                            max_output_tokens=600,
+                        ),
+                    )
+                    # response.text is None when Gemini's safety filter blocks output
+                    reply = (response.text or "").strip()
+                    break
+                except Exception as e:
+                    if ("429" in str(e) or "quota" in str(e).lower()) and attempt < 2:
+                        await asyncio.sleep(15 * (attempt + 1))
+                        continue
+                    reply = f"[ERROR: {e}]"
+                    break
+        elapsed = time.perf_counter() - t0
+
+        # Append to clean history using Gemini's "model" role (not "assistant")
+        history.append({"role": "user",  "content": turn_msg})
+        history.append({"role": "model", "content": reply})
+
+        # Match Gemini's response back to catalog entries for structured constraint checks
+        gemini_products = _match_gpt_products_to_catalog(reply, catalog_products)
+
+        # Infer response type (same heuristic as GPT runner)
+        has_bullets  = bool(re.search(r"^\s*[\-\*\d]+[\.\)]\s+\S", reply, re.M))
+        has_question = (bool(re.search(r"(what|which|how|could you).{0,60}\?", reply, re.I))
+                        or reply.rstrip().endswith("?"))
+        rtype = "recommendations" if has_bullets else ("question" if has_question else "unknown")
+
+        turn_results.append({
+            "user":          turn_msg,
+            "assistant":     reply,
+            "response_type": rtype,
+            "n_recs":        len(gemini_products),
+            "products":      gemini_products,
             "elapsed_s":     round(elapsed, 2),
         })
 
@@ -851,27 +1058,133 @@ def check_final_turn_constraints(scenario: Dict, turn_results: List[Dict]) -> Tu
     return score, notes if notes else ["no deterministic constraints to check"]
 
 
+def check_constraint_drift_all_turns(
+    scenario:     Dict,
+    turn_results: List[Dict],
+) -> Dict:
+    """
+    Check brand exclusion and budget constraints on EVERY turn, not just the last.
+
+    A constraint is 'active' for a turn when the scenario's per_turn_constraints
+    list specifies it for that turn index. Only turns that (a) have an active
+    constraint AND (b) returned at least one structured product are counted as
+    'applicable'. Turns with empty product lists are skipped so that clarifying-
+    question turns don't inflate the denominator.
+
+    Returns a dict:
+        drift_rate:   float or None — total_violations / n_applicable.
+                      None when no applicable (turn, constraint) pairs exist.
+        per_turn:     list of per-turn check result dicts.
+        violations:   list of human-readable violation strings.
+        n_applicable: int — how many (turn, constraint) pairs were evaluated.
+        n_violations: int — how many violations were found.
+
+    Budget tolerance: 5% (matching check_final_turn_constraints).
+    Brand matching: case-insensitive; checks both brand field and product name.
+    """
+    ptc = scenario.get("per_turn_constraints")
+    if not ptc or not turn_results:
+        # Scenario has no per-turn constraint spec — nothing to check.
+        return {"drift_rate": None, "per_turn": [], "violations": [], "n_applicable": 0, "n_violations": 0}
+
+    per_turn: List[Dict] = []
+    all_violations: List[str] = []
+    n_applicable = 0
+    n_violations = 0
+
+    for turn_idx, constraints in enumerate(ptc):
+        if turn_idx >= len(turn_results):
+            break
+
+        turn = turn_results[turn_idx]
+        products = turn.get("products") or []
+
+        # Skip turns with no structured products (e.g. clarifying questions, follow-up Q&A).
+        if not products or not constraints:
+            per_turn.append({"turn": turn_idx + 1, "skipped": True, "reason": "no products or no constraints"})
+            continue
+
+        turn_notes: List[str] = []
+        turn_violations = 0
+
+        # ── Brand exclusion check ──────────────────────────────────────────
+        excluded = constraints.get("excluded_brands") or []
+        for brand in excluded:
+            brand_lower = brand.lower()
+            for p in products:
+                p_brand = (p.get("brand") or "").lower()
+                p_name  = (p.get("name")  or "").lower()
+                if brand_lower in p_brand or brand_lower in p_name:
+                    msg = (f"✗ Turn {turn_idx+1}: excluded brand '{brand}' found "
+                           f"in '{p.get('brand','')} {p.get('name','')[:30]}'")
+                    turn_notes.append(msg)
+                    all_violations.append(msg)
+                    turn_violations += 1
+                    n_violations += 1
+                    break   # count once per excluded brand per turn
+            else:
+                turn_notes.append(f"✓ Turn {turn_idx+1}: '{brand}' correctly absent")
+            n_applicable += 1
+
+        # ── Budget check ───────────────────────────────────────────────────
+        budget = constraints.get("budget_max_usd")
+        if budget:
+            over = [
+                p for p in products
+                if p.get("price") is not None and float(p["price"]) > budget * 1.05
+            ]
+            if over:
+                msg = (f"✗ Turn {turn_idx+1}: {len(over)} product(s) over "
+                       f"${budget} budget (e.g. '{over[0].get('name','?')[:30]}' "
+                       f"${over[0].get('price','?')})")
+                turn_notes.append(msg)
+                all_violations.append(msg)
+                turn_violations += 1
+                n_violations += 1
+            else:
+                turn_notes.append(f"✓ Turn {turn_idx+1}: all {len(products)} products within ${budget}")
+            n_applicable += 1
+
+        per_turn.append({
+            "turn":       turn_idx + 1,
+            "skipped":    False,
+            "violations": turn_violations,
+            "notes":      turn_notes,
+        })
+
+    drift_rate = (n_violations / n_applicable) if n_applicable > 0 else None
+    return {
+        "drift_rate":   round(drift_rate, 4) if drift_rate is not None else None,
+        "per_turn":     per_turn,
+        "violations":   all_violations,
+        "n_applicable": n_applicable,
+        "n_violations": n_violations,
+    }
+
+
 # ============================================================================
 # Main runner
 # ============================================================================
 
 async def run_all_scenarios(
-    scenarios:   List[Dict],
-    base_url:    str,
-    systems:     List[str],
-    save_path:   Optional[str],
-    verbose:     bool,
-    sajjad_url:  str = "http://localhost:9003",
-    pplx_key:    Optional[str] = None,
+    scenarios:    List[Dict],
+    base_url:     str,
+    systems:      List[str],
+    save_path:    Optional[str],
+    verbose:      bool,
+    sajjad_url:   str = "http://localhost:9003",
+    pplx_key:     Optional[str] = None,
+    gemini_key:   Optional[str] = None,
 ) -> Dict:
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
         print("ERROR: OPENAI_API_KEY not set.")
         sys.exit(1)
 
-    oai      = AsyncOpenAI(api_key=openai_key)
-    gpt_sem  = asyncio.Semaphore(4)
-    pplx_sem = asyncio.Semaphore(2)  # Perplexity free tier: ~3 req/min
+    oai        = AsyncOpenAI(api_key=openai_key)
+    gpt_sem    = asyncio.Semaphore(4)
+    pplx_sem   = asyncio.Semaphore(2)   # Perplexity free tier: ~3 req/min
+    gemini_sem = asyncio.Semaphore(3)   # Gemini free tier: ~15 RPM
 
     # Initialise Perplexity client if needed
     pplx = None
@@ -882,6 +1195,18 @@ async def run_all_scenarios(
             sys.exit(1)
         pplx = AsyncOpenAI(api_key=_pplx_key, base_url="https://api.perplexity.ai")
 
+    # Initialise Gemini client if needed (lazy — google-genai only required for this system)
+    gemini_client = None
+    if "gemini" in systems:
+        if not _GEMINI_AVAILABLE:
+            print("ERROR: google-genai not installed. Run: pip install google-genai")
+            sys.exit(1)
+        _gemini_key = gemini_key or os.getenv("GEMINI_API_KEY")
+        if not _gemini_key:
+            print("ERROR: GEMINI_API_KEY not set (required for --systems gemini).")
+            sys.exit(1)
+        gemini_client = _genai_lib.Client(api_key=_gemini_key)
+
     total = len(scenarios)
     print(f"\n{BOLD}Multi-Turn G-Eval Harness{RST}")
     print(f"  Scenarios: {total}")
@@ -891,10 +1216,13 @@ async def run_all_scenarios(
         print(f"  Sajjad URL: {sajjad_url}")
     if "gpt" in systems:
         print(f"  GPT:       catalog-bound (searches IDSS catalog before each turn — fair comparison)")
+    if "gemini" in systems:
+        print(f"  Gemini:    {GEMINI_MODEL}, catalog-bound (same catalog injection as GPT — fair comparison)")
+        print(f"             Judge: GPT-4o-mini (NOT Gemini — avoids self-preference bias)")
     if "perplexity" in systems:
         print(f"  Perplexity: sonar (⚠ WEB-AUGMENTED — all Perplexity models use web search)")
         print(f"  {YEL}  Perplexity results are INFORMATIONAL ONLY — not a fair comparison.")
-        print(f"     Primary fair comparison: IDSS vs GPT (catalog-bound) vs Sajjad.{RST}")
+        print(f"     Primary fair comparison: IDSS vs GPT vs Gemini (catalog-bound) vs Sajjad.{RST}")
     print(f"  Weights:   judge=45%  constraint=55%")
 
     all_results: List[Dict] = []
@@ -936,6 +1264,15 @@ async def run_all_scenarios(
                         catalog_client=client,
                         idss_url=base_url,
                     )
+                elif system == "gemini":
+                    # Catalog-bound, same design as GPT: IDSS catalog injected before each turn.
+                    # Uses role "model" (not "assistant") per Gemini API convention.
+                    assert gemini_client is not None
+                    turn_results, elapsed = await run_gemini_scenario(
+                        gemini_client, sc, gemini_sem,
+                        catalog_client=client,
+                        idss_url=base_url,
+                    )
                 else:
                     turn_results, elapsed = [], 0.0
 
@@ -954,23 +1291,35 @@ async def run_all_scenarios(
                 total_prompt_tokens     += judge_usage.get("prompt_tokens",     0)
                 total_completion_tokens += judge_usage.get("completion_tokens", 0)
 
-                # Deterministic constraint check
+                # Deterministic constraint check (final-turn only — backward-compatible)
                 constraint_score, constraint_notes = check_final_turn_constraints(sc, turn_results)
+
+                # Constraint drift rate — checks EVERY turn, not just the last.
+                # drift_result["drift_rate"] is None when no per_turn_constraints are defined.
+                drift_result = check_constraint_drift_all_turns(sc, turn_results)
 
                 # Combined final score: 45% judge + 55% constraint
                 # Higher constraint weight prevents judge hallucination (0.0 judge + 1.0 constraint = 0.55 → PASS)
                 final_score = 0.45 * judge_score + 0.55 * constraint_score
                 passed = final_score >= PASS_THRESHOLD
 
+                drift_str = (f"{drift_result['drift_rate']:.3f}"
+                             if drift_result["drift_rate"] is not None else "N/A")
+                drift_color = (RED if (drift_result["drift_rate"] or 0) > 0 else GREEN)
+
                 status = f"{GREEN}PASS{RST}" if passed else f"{RED}FAIL{RST}"
                 print(f"\n  [{system.upper()}] {status}  "
                       f"final={final_score:.3f}  "
                       f"judge={judge_score:.3f}  "
                       f"constraint={constraint_score:.3f}  "
+                      f"drift={drift_color}{drift_str}{RST}  "
                       f"elapsed={elapsed:.1f}s")
                 print(f"  [{system.upper()}] reason: {judge_reason}")
                 for note in constraint_notes:
                     print(f"  [{system.upper()}] constraint: {note}")
+                if drift_result["violations"]:
+                    for v in drift_result["violations"]:
+                        print(f"  [{system.upper()}] drift: {v}")
 
                 sc_result["systems"][system] = {
                     "turn_results":      turn_results,
@@ -980,20 +1329,22 @@ async def run_all_scenarios(
                     "passed":            passed,
                     "judge_reason":      judge_reason,
                     "constraint_notes":  constraint_notes,
+                    "drift_rate":        drift_result["drift_rate"],
+                    "drift_details":     drift_result,
                     "total_elapsed_s":   round(elapsed, 2),
                 }
 
             # Delta IDSS − each baseline
             if "idss" in sc_result["systems"]:
                 idss_score = sc_result["systems"]["idss"]["final_score"]
-                for baseline in ("gpt", "sajjad", "perplexity"):
+                for baseline in ("gpt", "gemini", "sajjad", "perplexity"):
                     if baseline in sc_result["systems"]:
                         delta = idss_score - sc_result["systems"][baseline]["final_score"]
                         delta_str = (f"{GREEN}+{delta:.3f}{RST}" if delta > 0
                                      else f"{RED}{delta:.3f}{RST}")
                         print(f"\n  DELTA (IDSS − {baseline.upper()}): {delta_str}")
                 sc_result.setdefault("deltas", {})
-                for baseline in ("gpt", "sajjad", "perplexity"):
+                for baseline in ("gpt", "gemini", "sajjad", "perplexity"):
                     if baseline in sc_result["systems"]:
                         sc_result["deltas"][f"idss_minus_{baseline}"] = round(
                             idss_score - sc_result["systems"][baseline]["final_score"], 4
@@ -1012,7 +1363,7 @@ async def run_all_scenarios(
     for sys in systems:
         header += f"  {sys.upper():>{col_w}}"
     if "idss" in systems:
-        for baseline in [s for s in ("gpt", "sajjad", "perplexity") if s in systems]:
+        for baseline in [s for s in ("gpt", "gemini", "sajjad", "perplexity") if s in systems]:
             header += f"  {'Δ vs '+baseline.upper():>{col_w}}"
     print(header)
     print(f"  {'─'*80}")
@@ -1034,7 +1385,7 @@ async def run_all_scenarios(
                 row += f"  {'N/A':>{col_w}}"
         if "idss" in r["systems"]:
             idss_sc = r["systems"]["idss"]["final_score"]
-            for baseline in [s for s in ("gpt", "sajjad", "perplexity") if s in r["systems"]]:
+            for baseline in [s for s in ("gpt", "gemini", "sajjad", "perplexity") if s in r["systems"]]:
                 d = idss_sc - r["systems"][baseline]["final_score"]
                 c = GREEN if d > 0 else RED
                 row += f"  {c}{d:>+{col_w}.3f}{RST}"
@@ -1049,7 +1400,7 @@ async def run_all_scenarios(
     if "idss" in systems:
         idss_avg = (sum(system_scores["idss"]) / len(system_scores["idss"])
                     if system_scores["idss"] else 0.0)
-        for baseline in [s for s in ("gpt", "sajjad", "perplexity") if s in systems]:
+        for baseline in [s for s in ("gpt", "gemini", "sajjad", "perplexity") if s in systems]:
             bl_avg = (sum(system_scores[baseline]) / len(system_scores[baseline])
                       if system_scores[baseline] else 0.0)
             d = idss_avg - bl_avg
@@ -1061,12 +1412,21 @@ async def run_all_scenarios(
         scores = system_scores[sys]
         avg = sum(scores) / len(scores) if scores else 0.0
         pass_n = sum(1 for s in scores if s >= PASS_THRESHOLD)
-        print(f"  {sys.upper():<12} avg={avg:.3f}  pass={pass_n}/{len(scores)} ({100*pass_n//max(1,len(scores))}%)")
+        # Compute avg drift_rate across scenarios (skip None — no per_turn_constraints)
+        drift_vals = [
+            r["systems"][sys]["drift_rate"]
+            for r in all_results
+            if sys in r["systems"] and r["systems"][sys].get("drift_rate") is not None
+        ]
+        drift_str = f"  drift={sum(drift_vals)/len(drift_vals):.3f}" if drift_vals else ""
+        print(f"  {sys.upper():<12} avg={avg:.3f}  pass={pass_n}/{len(scores)} ({100*pass_n//max(1,len(scores))}%){drift_str}")
 
     print(f"\n  {YEL}Scoring: 45% LLM judge (full transcript) + 55% deterministic constraint checks.{RST}")
     print(f"  {YEL}Judge does NOT penalize silent constraint enforcement (DB/search filtering).{RST}")
     if "gpt" in systems:
         print(f"  {YEL}GPT: catalog-bound — each turn searches IDSS catalog so GPT picks from same products.{RST}")
+    if "gemini" in systems:
+        print(f"  {YEL}Gemini: {GEMINI_MODEL}, catalog-bound. Judge is GPT-4o-mini (not Gemini — avoids self-bias).{RST}")
     if "perplexity" in systems:
         print(f"  {YEL}⚠ Perplexity: WEB-AUGMENTED (sonar). No offline Perplexity API model exists.")
         print(f"     Excluded from primary fair ranking. Shown as informational reference.{RST}")
@@ -1095,18 +1455,41 @@ async def run_all_scenarios(
                 "Scoring: 45% judge (full transcript, silent-enforcement-aware) + "
                 "55% constraint (deterministic checks). "
                 "IDSS/Sajjad: session-state enforces constraints deterministically. "
-                "GPT: catalog-bound — each turn calls /api/search-products so GPT "
-                "recommends from same product pool as IDSS (per mentor Negin Golrezaei: "
-                "'if we don't give it our database, how can we compare?'). "
+                "GPT: catalog-bound gpt-4o-mini — each turn calls IDSS /chat to get products, "
+                "same pool as IDSS (per mentor Negin Golrezaei: 'if we don't give it our database, how can we compare?'). "
+                "Gemini: catalog-bound gemini-2.0-flash — same injection design as GPT. "
+                "Judge: GPT-4o-mini for ALL systems (avoids Gemini self-preference bias). "
                 "Perplexity: sonar (⚠ web-augmented) — INFORMATIONAL ONLY. "
                 "All Perplexity API models use web search; no offline model exists. "
-                "Primary fair comparison: IDSS vs GPT-catalog-bound vs Sajjad."
+                "Primary fair comparison: IDSS vs GPT vs Gemini (catalog-bound) vs Sajjad."
             ),
             "summary": {
                 sys: {
                     "avg_score":  round(sum(system_scores[sys]) / max(1, len(system_scores[sys])), 4),
                     "pass_count": sum(1 for s in system_scores[sys] if s >= PASS_THRESHOLD),
                     "n":          len(system_scores[sys]),
+                    # avg_drift_rate: mean over scenarios with per_turn_constraints defined.
+                    # None means no scenarios had per_turn_constraints (unexpected).
+                    "avg_drift_rate": (
+                        round(
+                            sum(
+                                r["systems"][sys]["drift_rate"]
+                                for r in all_results
+                                if sys in r["systems"]
+                                and r["systems"][sys].get("drift_rate") is not None
+                            ) / max(1, sum(
+                                1 for r in all_results
+                                if sys in r["systems"]
+                                and r["systems"][sys].get("drift_rate") is not None
+                            )),
+                            4,
+                        )
+                        if any(
+                            r["systems"].get(sys, {}).get("drift_rate") is not None
+                            for r in all_results
+                        )
+                        else None
+                    ),
                 }
                 for sys in systems
             },
@@ -1137,9 +1520,9 @@ async def run_all_scenarios(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Multi-turn G-Eval: 3-way fair comparison of IDSS, GPT-4o-mini (catalog-bound), "
-            "and Sajjad's idss-mcp. Perplexity sonar is informational only (web-augmented, "
-            "no offline Perplexity API model exists)."
+            "Multi-turn G-Eval: 5-way fair comparison of IDSS, GPT-4o-mini (catalog-bound), "
+            "Gemini-2.0-flash (catalog-bound), and Sajjad's idss-mcp. "
+            "Perplexity sonar is informational only (web-augmented, no offline API model exists)."
         )
     )
     parser.add_argument("--url",       default="http://localhost:8001",
@@ -1148,16 +1531,18 @@ def main():
                         help="Sajjad idss-mcp URL (default: http://localhost:9003)")
     parser.add_argument("--perplexity-key", default=None,
                         help="Perplexity API key (or set PERPLEXITY_API_KEY env var)")
+    parser.add_argument("--gemini-key", default=None,
+                        help="Gemini API key (or set GEMINI_API_KEY env var)")
     parser.add_argument("--save",      help="Path to save JSON results")
     parser.add_argument("--scenario",  type=int, help="Run only this scenario ID")
     parser.add_argument("--systems",   default="idss,gpt",
-                        help="Comma-separated systems to run: idss,gpt,perplexity,sajjad "
+                        help="Comma-separated systems to run: idss,gpt,gemini,perplexity,sajjad "
                              "(default: idss,gpt)")
     parser.add_argument("--verbose",   action="store_true",
                         help="Print full turn text")
     args = parser.parse_args()
 
-    valid_systems = {"idss", "gpt", "perplexity", "sajjad"}
+    valid_systems = {"idss", "gpt", "gemini", "perplexity", "sajjad"}
     systems = [s.strip().lower() for s in args.systems.split(",")]
     for s in systems:
         if s not in valid_systems:
@@ -1180,6 +1565,7 @@ def main():
         verbose=args.verbose,
         sajjad_url=args.sajjad_url,
         pplx_key=args.perplexity_key,
+        gemini_key=args.gemini_key,
     ))
 
 

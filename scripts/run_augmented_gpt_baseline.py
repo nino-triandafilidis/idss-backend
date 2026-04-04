@@ -63,6 +63,7 @@ try:
         QUERIES,
         PASS_THRESHOLD,
         compute_final_score,
+        check_disclosure,
     )
 except ImportError as e:
     print(f"ERROR: Cannot import from run_geval.py: {e}")
@@ -327,7 +328,7 @@ async def score_augmented_quality_async(
         quality_note=quality_note,
         catalog_str=catalog_str,
         rtype=rtype,
-        response_text=response_text[:700],
+        response_text=response_text[:1500],
     )
 
     _zero: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
@@ -443,10 +444,20 @@ async def run_augmented(
             oai, q, gpt_text, products, gpt_rtype
         )
 
-        # Final score: type 40% + grounding 15% + quality 45%
-        # (brand/filter/stock not applicable — GPT has no structured output)
-        # grounding replaces the "structured output" component
-        final = 0.40 * type_score + 0.15 * grounding_score + 0.45 * quality_score
+        # Disclosure check — only active for catalog_impossible group queries.
+        # GPT receives IDSS's product list; if IDSS relaxed budget, GPT gets
+        # those products and must still add disclosure language to pass.
+        # Build a minimal resp dict that check_disclosure expects.
+        _resp_for_disclosure = {"message": gpt_text, "recommendations": products}
+        disclosure_score, disclosure_note = check_disclosure(q, _resp_for_disclosure)
+
+        # Final score: type 40% + grounding 15% + quality 45% (baseline formula).
+        # When disclosure_score is present (catalog_impossible group), replace 20%
+        # of quality weight with disclosure — mirrors the weight in compute_final_score.
+        if disclosure_score is not None:
+            final = 0.40 * type_score + 0.15 * grounding_score + 0.20 * disclosure_score + 0.25 * quality_score
+        else:
+            final = 0.40 * type_score + 0.15 * grounding_score + 0.45 * quality_score
 
         return {
             "id":               q["id"],
@@ -457,6 +468,8 @@ async def run_augmented(
             "type_score":       type_score,
             "grounding_score":  round(grounding_score, 4),
             "quality_score":    quality_score,
+            "disclosure_score": disclosure_score,
+            "disclosure_note":  disclosure_note,
             "type_note":        type_note,
             "grounding_note":   grounding_note,
             "reason":           reason,
