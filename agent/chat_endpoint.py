@@ -114,6 +114,29 @@ async def _llm_injection_check(message: str) -> bool:
         return False  # Fail open — a broken guard shouldn't block users
 
 
+# Layer 2b: Shopping-context override — when a suspicion keyword ("forget",
+# "ignore", etc.) appears alongside shopping terms rather than instruction/role
+# language, it's a filter refinement, not an injection attempt.  Skip the LLM
+# call to prevent false positives like "forget the 450 dollars".
+_SHOPPING_OVERRIDE_RE = re.compile(
+    # "forget/ignore/drop/remove …" + shopping term
+    r"(?:forget|ignore|drop|remove|skip|ditch|scrap|disregard)"
+    r"\s+(?:the\s+|about\s+(?:the\s+)?|my\s+)?"
+    r"(?:"
+    r"\$?\d"                                            # dollar amounts
+    r"|budget|price|cost|dollars?"                      # price language
+    r"|brand|screen|ram|storage|specs?"                  # spec language
+    r"|gaming|machine.learning|creative|web.dev|ml\b"   # use-case language
+    r"|requirement|filter|preference|constraint|limit"  # meta / filter language
+    r")"
+    # "let's say / suppose / imagine" + shopping qualifier
+    r"|(?:let'?s\s+say|suppose|imagine)"
+    r"\s+(?:\S+\s+){0,4}"  # up to 4 words gap
+    r"(?:under|over|about|around|budget|cheaper|more|less|bigger|smaller|\$\d)",
+    re.IGNORECASE,
+)
+
+
 async def _is_prompt_injection(message: str) -> bool:
     """Hybrid injection guard: regex fast-path → LLM for suspicious-but-ambiguous messages."""
     # Layer 1: regex — instant, no LLM cost
@@ -121,6 +144,9 @@ async def _is_prompt_injection(message: str) -> bool:
         return True
     # Layer 2: suspicion pre-screen — skip LLM entirely for normal messages
     if not _SUSPICION_RE.search(message):
+        return False
+    # Layer 2b: shopping-context override — "forget the budget" is refinement, not injection
+    if _SHOPPING_OVERRIDE_RE.search(message):
         return False
     # Layer 3: LLM classifier — only reached for messages that look suspicious
     return await _llm_injection_check(message)
@@ -248,6 +274,54 @@ _MODEL_NUMBER_RE = re.compile(r"\b[A-Za-z]\d{1,4}\b|\b\d{4,}\b", re.IGNORECASE)
 # anywhere in the message (not just at the start).
 # Guards ("not session.active_domain" + domain hint) prevent mid-session false positives.
 _COMPARE_RE = re.compile(r"\bcompar\w*\b", re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Fast-path keyword / regex constants for post-recommendation intent routing.
+# Defined at module level so tests can import and verify against production.
+# ---------------------------------------------------------------------------
+_FAST_BEST_VALUE_KWS = (
+    "best value", "get best", "show me the best", "best pick",
+    # natural paraphrases that previously fell through to targeted_qa
+    "top pick",
+    "best bang for the buck",
+    "bang for your buck",
+    "most value for money",
+    "value for money",
+    "best deal",
+    "best option overall",
+    "best overall",
+    "best one",
+    "which do you recommend",
+    "what would you pick",
+    "what do you suggest",
+)
+
+_FAST_PROS_CONS_KWS = (
+    "tell me more about these",
+    "pros and cons",
+    "worth the price",
+    "what do you get for the extra",
+    "trade-off", "trade off", "tradeoff", "tradeoffs",
+    "battery life on these",
+    "how is the battery",
+    # natural paraphrases that previously fell through to LLM
+    "strengths and weaknesses",
+    "upsides and downsides",
+    "upside and downside",
+    "advantages and disadvantages",
+    "what's good and bad",
+    "good and bad about",
+    "break it down for me",
+    "give me the rundown",
+    "walk me through",
+)
+
+_CASUAL_PURCHASE_RE = re.compile(
+    r"\b(?:i'?ll take|i(?:'?ll| will) get|let me get|give me|i want)"
+    r"\s+(?:the\s+|that\s+|this\s+)?"
+    r"(?:first|second|third|fourth|1st|2nd|3rd|4th|one|two|three|four|[1-4]|it|that(?: one)?|this(?: one)?)\b",
+    re.IGNORECASE,
+)
 
 
 def _normalize_for_cache(text: str) -> str:
@@ -533,7 +607,7 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
     session.question_count = agent_state["question_count"]
     if agent_state["domain"]:
         session_manager.set_active_domain(session_id, agent_state["domain"])
-    session_manager.update_filters(session_id, agent.get_search_filters())
+    session_manager.update_filters(session_id, agent.get_search_filters(), replace=True)
     session_manager._persist(session_id)
 
     response_type = agent_response.get("response_type")
@@ -1086,22 +1160,7 @@ async def _handle_post_recommendation(
     # Fast intent router: compare vs. refine vs. other
     # -----------------------------------------------------------------------
     # Keyword fast-path skips the LLM call for obvious fixed-button messages
-    _FAST_BEST_VALUE_KWS = (
-        "best value", "get best", "show me the best", "best pick",
-    )
-    # "Tell me more" and "pros and cons" → text-only response, NO product cards
-    _FAST_PROS_CONS_KWS = (
-        "tell me more about these",   # exact text from the action bar button
-        "pros and cons",              # any pros/cons request
-        "worth the price",            # ActionBar "Worth the price?" chip
-        # Price-spread and trade-off questions — should return prose explanation,
-        # NOT a comparison table. Keep them here so they bypass the compare handler.
-        "what do you get for the extra",  # RAG chip: "What do you get for the extra $X?"
-        "trade-off", "trade off", "tradeoff", "tradeoffs",  # "What are the trade-offs?"
-        # Battery life questions — user wants text answer for all products, not a spec table
-        "battery life on these",      # "How is the battery life on these laptops?"
-        "how is the battery",         # "How is the battery life on..."
-    )
+    # _FAST_BEST_VALUE_KWS, _FAST_PROS_CONS_KWS defined at module level (importable by tests)
     # Targeted Q&A: "which has the best X?" → show only the 1-2 winning products
     # with detailed reasoning.  Must be checked BEFORE _FAST_COMPARE_KWS because
     # "which is better" is a compare (all products) but "which has the best X" is
@@ -1226,6 +1285,11 @@ async def _handle_post_recommendation(
         # "add X to my cart" — catch BEFORE the LLM call so product names with
         # specs (e.g. "add Lenovo IdeaPad L340 Gaming Laptop, 15.6 Inch FHD to cart")
         # don't get misclassified as "new_search" and wipe the session.
+        intent = "add_to_cart"
+    elif _CASUAL_PURCHASE_RE.search(msg_lower):
+        # Casual purchase: "I'll take the second one", "let me get that", "give me the first"
+        # The existing compound-keyword check requires an explicit container word (cart/bag/…).
+        # These phrases miss it, so they fall through to LLM which misroutes them as new_search.
         intent = "add_to_cart"
     else:
         intent = await detect_post_rec_intent(clean_message)
@@ -2636,7 +2700,7 @@ async def _handle_post_recommendation(
         session.agent_filters = agent_state["filters"]
         session.agent_questions_asked = agent_state["questions_asked"]
         session.agent_history = agent_state["history"]
-        session_manager.update_filters(session_id, search_filters)
+        session_manager.update_filters(session_id, search_filters, replace=True)
         session_manager._persist(session_id)
 
         if active_domain == "vehicles":
