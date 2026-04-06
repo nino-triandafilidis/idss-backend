@@ -381,10 +381,37 @@ def evaluate_with_custom_judge(rows: list, test_cases: list) -> list:
     return results
 
 
-def main(use_laptop_queries: bool = True, baseline_only: bool = False):
+def _run_single_eval(
+    test_cases: list,
+    baseline_only: bool,
+    load_path: str,
+    rows_override: list | None = None,
+) -> tuple[list, list]:
+    """Run one full eval: get rows (agent or baseline, or use rows_override), then judge. Returns (rows, results)."""
+    if rows_override is not None:
+        rows = rows_override
+    elif baseline_only:
+        rows = [run_baseline(tc) for tc in test_cases]
+    elif load_path:
+        load_file = Path(load_path)
+        if not load_file.is_absolute():
+            load_file = _THIS_DIR / load_path
+        with open(load_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        rows = data["rows"]
+    else:
+        async def run_all():
+            return [await run_one(tc) for tc in test_cases]
+        rows = asyncio.run(run_all())
+    results = evaluate_with_custom_judge(rows, test_cases)
+    return rows, results
+
+
+def main(use_laptop_queries: bool = True, baseline_only: bool = False, n_runs: int = 50):
     """Run evaluation. By default uses laptop-only queries from testing/query_data_enriched.csv.
     Set env USE_LAPTOP_QUERIES=0 to use test_cases.json instead.
     If baseline_only=True, use fixed baseline message instead of the agent (no API/Redis).
+    If n_runs > 1, run the full pipeline n_runs times and report metrics as the average of those runs.
     """
     use_laptop = os.environ.get("USE_LAPTOP_QUERIES", "1").strip().lower() not in ("0", "false", "no")
     print("Loading test cases...")
@@ -400,56 +427,127 @@ def main(use_laptop_queries: bool = True, baseline_only: bool = False):
     else:
         test_cases = load_test_cases()
         print(f"Using {len(test_cases)} test cases from test_cases.json")
+
+    load_path = os.environ.get("LOAD_ROWS_FROM", "").strip()
     if baseline_only:
         print("Baseline mode: Supabase-only recommendations (extract filters -> search DB -> format from results).")
-        rows = [run_baseline(tc) for tc in test_cases]
-    else:
+    elif not load_path:
         print(f"Running agent for {len(test_cases)} test cases...")
         if not os.environ.get("OPENAI_API_KEY"):
             print("Warning: OPENAI_API_KEY not set. Agent may fail.", file=sys.stderr)
 
-    async def run_all():
-        rows = []
-        for tc in test_cases:
-            row = await run_one(tc)
-            rows.append(row)
-        return rows
+    print(f"Running {n_runs} evaluation run(s); metrics will be averaged.")
+    all_results = []  # list of result lists (each list has one dict per test_id)
+    all_rows = []  # list of row lists (each run's rows for best/worst convo logging)
+    loaded_rows = None  # when load_path set, load once and reuse for judge-only reruns
+    for run_idx in range(n_runs):
+        if n_runs > 1:
+            print(f"  Run {run_idx + 1}/{n_runs}...")
+        if load_path and loaded_rows is not None:
+            rows, results = _run_single_eval(test_cases, baseline_only, "", rows_override=loaded_rows)
+        else:
+            rows, results = _run_single_eval(test_cases, baseline_only, load_path)
+            if load_path:
+                loaded_rows = rows
+        if run_idx == 0 and not baseline_only and not load_path:
+            out_dir = _THIS_DIR / "results"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            rows_file = out_dir / "agent_response_rows.json"
+            with open(rows_file, "w", encoding="utf-8") as f:
+                json.dump({"rows": rows, "test_cases": test_cases}, f, indent=2)
+            print(f"Saved {len(rows)} agent responses to {rows_file}")
+        all_rows.append(rows)
+        all_results.append(results)
 
-    # Optional: skip agent and load previously saved rows (re-run only the judge)
-    load_path = os.environ.get("LOAD_ROWS_FROM", "").strip()
-    if load_path and not baseline_only:
-        load_file = Path(load_path)
-        if not load_file.is_absolute():
-            load_file = _THIS_DIR / load_path
-        print(f"Loading saved rows from {load_file}...")
-        with open(load_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        rows = data["rows"]
-        test_cases = data["test_cases"]
-        print(f"Loaded {len(rows)} rows and {len(test_cases)} test cases. Running judge only.")
-    elif not baseline_only:
-        rows = asyncio.run(run_all())
-        out_dir = _THIS_DIR / "results"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        rows_file = out_dir / "agent_response_rows.json"
-        with open(rows_file, "w", encoding="utf-8") as f:
-            json.dump({"rows": rows, "test_cases": test_cases}, f, indent=2)
-        print(f"Saved {len(rows)} agent responses to {rows_file}")
+    # Aggregate: for each test_id, average score; passed = avg_score >= threshold; pass_rate; best/worst run convos (multi-turn)
+    id_to_scores = {}  # test_id -> list of (run_idx, score)
+    id_to_pass_count = {}
+    id_to_template = {}
+    for run_idx, results in enumerate(all_results):
+        for r in results:
+            tid = r["test_id"]
+            id_to_scores.setdefault(tid, []).append((run_idx, r["score"]))
+            if r["passed"]:
+                id_to_pass_count[tid] = id_to_pass_count.get(tid, 0) + 1
+            if tid not in id_to_template:
+                id_to_template[tid] = {
+                    "test_id": tid,
+                    "user_query": r["user_query"],
+                    "agent_message": r.get("agent_message", ""),
+                    "recommendations_summary": r.get("recommendations_summary"),
+                    "response_type": r.get("response_type"),
+                }
 
-    print("Evaluating with custom LLM-as-judge...")
-    results = evaluate_with_custom_judge(rows, test_cases)
+    def _row_for_test(rows: list, test_id: str) -> dict | None:
+        for row in rows:
+            if row.get("test_id") == test_id:
+                return row
+        return None
+
+    results = []
+    for tid in sorted(id_to_template.keys()):
+        pairs = id_to_scores[tid]  # [(run_idx, score), ...]
+        scores = [s for _, s in pairs]
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+        passed = avg_score >= _JUDGE_THRESHOLD
+        pass_rate = (id_to_pass_count.get(tid, 0) / n_runs) if n_runs else 0.0
+        t = id_to_template[tid]
+
+        # Best and worst run (by score) for this test_id — full multi-turn convo only in JSON
+        best_run = None
+        worst_run = None
+        if n_runs > 1 and all_rows and pairs:
+            best_idx = max(pairs, key=lambda x: x[1])[0]
+            worst_idx = min(pairs, key=lambda x: x[1])[0]
+            best_row = _row_for_test(all_rows[best_idx], tid)
+            worst_row = _row_for_test(all_rows[worst_idx], tid)
+            best_score = next(s for i, s in pairs if i == best_idx)
+            worst_score = next(s for i, s in pairs if i == worst_idx)
+            if best_row is not None:
+                best_run = {
+                    "score": round(best_score, 4),
+                    "conversation_input": best_row.get("conversation_input") or best_row.get("user_query", ""),
+                    "agent_message": best_row.get("agent_message", ""),
+                }
+            if worst_row is not None and (worst_idx != best_idx or best_run is None):
+                worst_run = {
+                    "score": round(worst_score, 4),
+                    "conversation_input": worst_row.get("conversation_input") or worst_row.get("user_query", ""),
+                    "agent_message": worst_row.get("agent_message", ""),
+                }
+            # Use best run's agent_message as the single representative in CSV / top-level
+            if best_run:
+                t["agent_message"] = best_run["agent_message"]
+
+        out_entry = {
+            "test_id": tid,
+            "user_query": t["user_query"],
+            "agent_message": t["agent_message"],
+            "score": round(avg_score, 4),
+            "passed": passed,
+            "pass_rate": round(pass_rate, 4),
+            "details": {"n_runs": n_runs, "threshold": _JUDGE_THRESHOLD, "avg_score": round(avg_score, 4)},
+            "recommendations_summary": t["recommendations_summary"],
+            "response_type": t["response_type"],
+        }
+        if best_run is not None:
+            out_entry["best_run"] = best_run
+        if worst_run is not None:
+            out_entry["worst_run"] = worst_run
+        results.append(out_entry)
 
     out_dir = _THIS_DIR / "results"
     out_dir.mkdir(parents=True, exist_ok=True)
     suffix = "_baseline" if baseline_only else ""
     out_json = out_dir / f"agent_response_eval_results{suffix}.json"
     out_csv = out_dir / f"agent_response_eval_results{suffix}.csv"
+    out_payload = {"n_runs": n_runs, "results": results}
     with open(out_json, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"Wrote {len(results)} results to {out_json}")
+        json.dump(out_payload, f, indent=2)
+    print(f"Wrote {len(results)} results (avg of {n_runs} runs) to {out_json}")
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv_module.writer(f)
-        w.writerow(["test_id", "user_query", "agent_message", "score", "passed", "details"])
+        w.writerow(["test_id", "user_query", "agent_message", "score", "passed", "pass_rate", "details"])
         for r in results:
             w.writerow([
                 r["test_id"],
@@ -457,12 +555,13 @@ def main(use_laptop_queries: bool = True, baseline_only: bool = False):
                 r["agent_message"],
                 r["score"],
                 r["passed"],
+                r.get("pass_rate", ""),
                 json.dumps(r["details"]) if isinstance(r["details"], dict) else str(r["details"]),
             ])
     print(f"Wrote CSV to {out_csv}")
 
     passed = sum(1 for r in results if r["passed"])
-    print(f"Passed: {passed}/{len(results)}")
+    print(f"Passed (by avg score): {passed}/{len(results)}")
     return 0 if passed == len(results) else 1
 
 
@@ -470,5 +569,11 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="Run agent response evaluation (G-Eval)")
     p.add_argument("--baseline", action="store_true", help="Run baseline only (fixed response, no agent)")
+    n_default = 50
+    try:
+        n_default = int(os.environ.get("N_RUNS", str(n_default)))
+    except (TypeError, ValueError):
+        pass
+    p.add_argument("--n-runs", type=int, default=n_default, metavar="N", help=f"Number of runs to average (default: {n_default})")
     args = p.parse_args()
-    sys.exit(main(baseline_only=args.baseline))
+    sys.exit(main(baseline_only=args.baseline, n_runs=args.n_runs))

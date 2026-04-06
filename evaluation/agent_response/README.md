@@ -64,12 +64,19 @@ export OLLAMA_MODEL_NAME=llama3.2
 python -m evaluation.agent_response.run_eval
 ```
 
+By default the pipeline runs **50 times** and reports metrics as the **average** of those runs (score and pass threshold are applied to the average; optional `pass_rate` is the fraction of runs that passed). Use `--n-runs 1` for a single run, or set `N_RUNS` in the environment.
+
+```bash
+python -m evaluation.agent_response.run_eval --n-runs 1    # single run
+python -m evaluation.agent_response.run_eval --n-runs 10  # average of 10 runs
+```
+
 Output:
 
 - `evaluation/agent_response/results/agent_response_eval_results.json`
 - `evaluation/agent_response/results/agent_response_eval_results.csv`
 
-Columns: `test_id`, `user_query`, `agent_message`, `score`, `passed`, `details`.
+JSON shape: `{"n_runs": N, "results": [...]}`. When `n_runs` > 1, each result includes **`best_run`** and **`worst_run`** (multi-turn): `score`, `conversation_input` (all user turns), and `agent_message` (all agent turns) for the run with highest and lowest judge score for that test. The top-level `agent_message` and CSV show the best run’s response. Columns: `test_id`, `user_query`, `agent_message`, `score` (avg), `passed`, `pass_rate`, `details`.
 
 ### Baseline (for comparison table)
 
