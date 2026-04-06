@@ -79,8 +79,9 @@ python -m evaluation.recommendations.expand_golden_to_50
 # 2. Populate ground truth (requires DB + network)
 python -m evaluation.recommendations.populate_ground_truth --golden evaluation/recommendations/golden_dataset.json --top 10 --backup
 
-# 3. Run evaluation
+# 3. Run evaluation (default: 50 runs, metrics averaged)
 python -m evaluation.recommendations.run_evaluation --golden evaluation/recommendations/golden_dataset.json
+# Optional: --n-runs 2 for a quick test, or --n-runs 1 for a single run
 
 # 4. Regenerate case report and figures (use latest summary in results/)
 python -m evaluation.recommendations.plot_eval_results

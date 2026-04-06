@@ -34,7 +34,11 @@ DIAGONAL_COLOR = "#6c757d"
 
 def load_results(path: Path) -> list:
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    # Support n-run format: {"n_runs": N, "results": [...]}
+    if isinstance(data, dict) and "results" in data:
+        return data["results"]
+    return data if isinstance(data, list) else []
 
 
 def stats(results: list) -> Tuple[int, float, float]:
