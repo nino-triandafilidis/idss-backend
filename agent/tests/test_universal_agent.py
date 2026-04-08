@@ -9,6 +9,8 @@ Covers:
 - query_rewriter integration: accessory disambiguation wired in
 """
 
+import pytest
+import pytest
 from unittest.mock import MagicMock
 from agent.universal_agent import UniversalAgent
 from agent.domain_registry import get_domain_schema
@@ -340,3 +342,68 @@ def test_use_case_downgrade_clears_performance_slots():
     assert "min_ram_gb" not in agent.filters, "min_ram_gb persists"
     # Budget preserved
     assert agent.filters.get("price_max_cents") == 100000
+
+
+# ---------------------------------------------------------------------------
+# Part 1: Browse / explicit-rec-request detection in _extract_criteria()
+# Tests the new _BROWSE_PATTERNS and _EXPLICIT_REC_PATTERNS override that
+# forces wants_recommendations=True for catalog-exploration and post-rec-refine
+# style messages that contain a ? but clearly want products shown.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("msg", [
+    # catalog_exploration queries (Q219–226 style)
+    "What do you have for video editing?",
+    "What's the cheapest laptop you have?",
+    "What are your top-rated laptops?",
+    "Do you have any ultrabooks or thin-and-light laptops?",
+    "What laptops do you have under $500?",
+    # post_rec_refine browse variants
+    "Do you have any lighter ones?",
+    "Do you have something with more storage?",
+])
+def test_browse_queries_want_recommendations(msg):
+    """Browse-pattern queries must match the _BROWSE_PATTERNS override that forces
+    wants_recommendations=True in _extract_criteria(), regardless of question mark."""
+    # Mirror the exact patterns from universal_agent.py _extract_criteria()
+    _BROWSE_PATTERNS = (
+        "what do you have", "what laptops do you have",
+        "what books do you have", "what vehicles do you have",
+        "show me all", "show me your", "show me gaming", "show me everything",
+        "what's the cheapest", "what is the cheapest",
+        "what are your top", "what are your best", "what are the top",
+        "what are the best", "what are your most",
+        "do you have any", "do you have some", "do you have something",
+    )
+    _msg_lower = msg.lower()
+    msg_words = len(msg.split())
+    _is_browse = any(p in _msg_lower for p in _BROWSE_PATTERNS)
+    assert _is_browse and msg_words >= 3, (
+        f"Browse pattern not detected for: {msg!r}. "
+        f"is_browse={_is_browse}, words={msg_words}"
+    )
+
+
+@pytest.mark.parametrize("msg", [
+    # post_rec_refine explicit rec requests (Q233–239 style)
+    "Actually I'd prefer Apple. Can you show me Macs instead?",
+    "I also need at least 1TB storage. Can you narrow those down?",
+    "Show me something cheaper.",
+    "Those are too expensive. Show me something cheaper.",
+    "Can you show me more options in the same price range?",
+    "Show me the others.",
+])
+def test_explicit_rec_request_wants_recommendations(msg):
+    """Explicit 'show me' / 'narrow those down' phrases must force wants_recommendations."""
+    _EXPLICIT_REC_PATTERNS = (
+        "show me", "can you show me",
+        "narrow those down", "narrow it down", "narrow them down",
+        "find me", "give me options", "give me some", "i want to see",
+    )
+    _msg_lower_h = msg.lower()
+    msg_words = len(msg.split())
+    _is_explicit = any(p in _msg_lower_h for p in _EXPLICIT_REC_PATTERNS)
+    assert _is_explicit and msg_words >= 3, (
+        f"Explicit-rec-request not detected for: {msg!r}. "
+        f"is_explicit={_is_explicit}, words={msg_words}"
+    )

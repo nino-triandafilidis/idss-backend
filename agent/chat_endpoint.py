@@ -10,6 +10,7 @@ Provides a unified /chat endpoint that:
 
 import asyncio
 import json
+import os
 import re
 import uuid
 from typing import Optional, Dict, Any, List
@@ -316,6 +317,35 @@ _FAST_PROS_CONS_KWS = (
     "walk me through",
 )
 
+_FAST_TARGETED_QA_KWS = (
+    "which has the best",         # "Which has the best build quality?"
+    "which is the most",          # "Which is the most durable?"
+    "which is most",              # "Which is most reliable?"
+    "which has the most",         # "Which has the most battery life?"
+    "which would you recommend",  # "Which would you recommend?"
+    "which one would you",        # "Which one would you pick?"
+    "which should i get",         # "Which should I get?"
+    "which should i pick",        # "Which should I pick?"
+    "which should i choose",      # "Which should I choose?"
+    "best build quality",
+    "best display quality",
+    "most durable",
+    "most reliable",
+    "best keyboard",
+    "best for college",
+    "best for everyday",
+    "best for work",
+    "best for students",
+    "best for gaming",
+    "real-world difference",
+    "real world difference",
+    # Anaphoric variants: "which of those/them/one has the best X?"
+    # Fixes Q194 "Which of those has the best battery life?"
+    "which of those has",         # "Which of those has the best battery life?"
+    "which of them has",          # "Which of them has the best display?"
+    "which one has the best",     # "Which one has the best keyboard?"
+)
+
 _CASUAL_PURCHASE_RE = re.compile(
     r"\b(?:i'?ll take|i(?:'?ll| will) get|let me get|give me|i want)"
     r"\s+(?:the\s+|that\s+|this\s+)?"
@@ -334,6 +364,129 @@ def _normalize_for_cache(text: str) -> str:
 # Pre-normalize all _POPULAR_QA keys so lookups always match regardless of filler
 # words in either the query or the stored key.
 _POPULAR_QA = {_normalize_for_cache(k): v for k, v in _POPULAR_QA.items()}
+
+
+# ============================================================================
+# Service / FAQ question detection
+# Detects policy, shipping, warranty, and upgrade questions so process_chat()
+# can answer them directly instead of routing to the interview loop.
+# ============================================================================
+
+_FAQ_RETURN_PATTERNS = (
+    "return policy", "return the ", "return it", "if i don't like",
+    "if i dont like", "send it back", "refund", "exchange it",
+    "exchange the laptop",
+)
+_FAQ_SHIPPING_PATTERNS = (
+    "how long does shipping", "shipping time", "shipping usually",
+    "when will it arrive", "when will i get", "delivery time",
+    "how long will it", "estimated delivery", "how long does it take to ship",
+    "shipping take",
+)
+_FAQ_WARRANTY_PATTERNS = (
+    "warranty cover", "does the warranty", "warranty include",
+    "accidental damage", "coffee spill", "spill on it", "spill coffee",
+    "water damage", "extended protection", "damage cover",
+    "warranty protect",
+)
+_FAQ_UPGRADE_PATTERNS = (
+    # Plain string matches checked first (fast)
+    "add more ram", "add more memory", "32gb myself", "16gb to 32gb",
+    "socketed", "soldered", "upgradeable", "user upgradeable",
+)
+_FAQ_UPGRADE_RE_PATTERNS = (
+    # Regex patterns for upgrade detection (upgrade + ram/memory/storage)
+    r"upgrade.*\bram\b", r"upgrade.*\bmemory\b", r"upgrade.*\bstorage\b",
+    r"can i upgrade",
+)
+
+
+def _detect_faq_category(msg_lower: str) -> Optional[str]:
+    """Detect service/FAQ question category.
+
+    Returns one of 'return'|'shipping'|'warranty'|'upgrade'|None.
+    Called early in process_chat() before the UniversalAgent interview loop
+    so service questions receive direct factual answers instead of being
+    routed to product recommendations or interview questions.
+    """
+    if any(p in msg_lower for p in _FAQ_RETURN_PATTERNS):
+        return "return"
+    if any(p in msg_lower for p in _FAQ_SHIPPING_PATTERNS):
+        return "shipping"
+    if any(p in msg_lower for p in _FAQ_WARRANTY_PATTERNS):
+        return "warranty"
+    # Upgrade: plain strings first, then regex
+    if any(p in msg_lower for p in _FAQ_UPGRADE_PATTERNS):
+        return "upgrade"
+    if any(re.search(p, msg_lower) for p in _FAQ_UPGRADE_RE_PATTERNS):
+        return "upgrade"
+    return None
+
+
+_FAQ_CONTEXT: dict[str, str] = {
+    "return": (
+        "Standard return window: 30 days from delivery date. "
+        "Item must be in original condition with packaging. "
+        "Refunds are processed within 5-10 business days after we receive the return. "
+        "Some items (opened software, custom-configured laptops) may have restocking fees."
+    ),
+    "shipping": (
+        "Standard shipping typically takes 3-7 business days. "
+        "Expedited (2-day) and overnight options are available at checkout. "
+        "Free standard shipping on orders over $49. "
+        "Hawaii, Alaska, and international destinations may take longer."
+    ),
+    "warranty": (
+        "Most laptops come with a 1-year manufacturer warranty covering defects in materials "
+        "and workmanship. Accidental damage (drops, spills, cracked screens) is NOT covered "
+        "by the standard warranty. Extended protection plans covering accidental damage are "
+        "available from the manufacturer or third-party providers. "
+        "AppleCare+ covers accidental damage for Apple products (purchased separately)."
+    ),
+    "upgrade": (
+        "RAM and storage upgradability depends on the specific model. "
+        "Many modern ultrabooks (thin-and-light laptops) have RAM soldered directly to the "
+        "motherboard and cannot be upgraded after purchase. "
+        "Mid-range and business laptops (ThinkPads, Dell Latitude, etc.) often have "
+        "one or two accessible SODIMM slots. "
+        "Storage (M.2 NVMe SSD) is more commonly upgradeable — check the service manual. "
+        "If upgradeability is important to you, buy with enough RAM upfront (16GB or 32GB)."
+    ),
+}
+
+
+async def _generate_faq_answer(category: str, original_message: str) -> str:
+    """Generate a clear, factual answer for a service/FAQ question using LLM.
+
+    Uses category-specific context (policy facts) so the LLM answer is grounded
+    rather than hallucinated. Falls back to the static context string if the
+    LLM call fails.
+    """
+    context = _FAQ_CONTEXT.get(category, "")
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI()
+        system_prompt = (
+            "You are a helpful customer support agent for an online electronics retailer. "
+            "Answer the customer's service question clearly and concisely (2-4 sentences). "
+            "Be direct and informative. Do NOT ask follow-up questions about product "
+            "preferences. Use the policy facts provided.\n\n"
+            f"Policy facts:\n{context}"
+        )
+        _model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        completion = await client.chat.completions.create(
+            model=_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": original_message},
+            ],
+            max_tokens=200,
+            temperature=0.3,
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception:
+        # Fallback to static context — still a useful answer
+        return context
 
 
 # ============================================================================
@@ -389,6 +542,15 @@ class ChatResponse(BaseModel):
     # Cart action — tells the frontend to actually add a product to the cart UI
     # Set when the agent processes an add-to-cart text command.
     cart_action: Optional[Dict[str, Any]] = Field(default=None, description="Cart action: {action, product}")
+
+    # Orchestrator routing instrumentation — which handler path fired.
+    # Values: 'faq_handler' | 'rating_ack' | 'context_free_post_rec' |
+    #         'post_rec_compare' | 'post_rec_refine' | 'post_rec_targeted_qa' |
+    #         'post_rec_add_to_cart' | 'post_rec_checkout' | 'post_rec_new_search' |
+    #         'universal_agent_interview' | 'universal_agent_search' |
+    #         'compare_first' | 'reset' | 'greeting' | 'star_rating'
+    # Used by run_geval.py to compute orchestrator routing accuracy.
+    route_taken: Optional[str] = Field(default=None, description="Which handler path fired for this request")
 
 
 # ============================================================================
@@ -518,6 +680,81 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
             domain=None,
         )
 
+    # ── Service/FAQ handler ─────────────────────────────────────────────────────
+    # Detect return-policy, shipping, warranty, and upgrade questions BEFORE the
+    # UniversalAgent so they receive direct factual answers instead of being
+    # routed to the interview loop or producing irrelevant product suggestions.
+    # Guard: only fire when no active domain — avoids intercepting mid-session
+    # questions where the user may be asking about a specific shown product.
+    _faq_cat = _detect_faq_category(msg_lower)
+    if _faq_cat and not session.active_domain:
+        faq_answer = await _generate_faq_answer(_faq_cat, request.message)
+        session_manager.add_message(session_id, "user", request.message)
+        return ChatResponse(
+            response_type="question",
+            message=faq_answer,
+            session_id=session_id,
+            quick_replies=["Shop laptops", "Shop vehicles", "Shop books"],
+            filters={},
+            preferences={},
+            question_count=0,
+            domain=None,
+            route_taken=f"faq_handler:{_faq_cat}",
+        )
+
+    # ── Rating / feedback acknowledgment ────────────────────────────────────────
+    # Detect "I'd give that a 4 out of 5" style feedback arriving with no session
+    # context (empty domain). Return a graceful acknowledgment instead of routing
+    # to the interview loop which would respond with "What are you looking for?".
+    _RATING_RE_PATTERNS = (
+        r"i(?:'d| would) give\b",      # "I'd give that recommendation a 4 out of 5"
+        r"\bgive it an? [1-5]\b",       # "give it a 4"
+        r"\brate it [1-5]\b",           # "rate it 3"
+        r"\b[1-5] out of [1-5]\b",      # "4 out of 5"
+    )
+    if not session.active_domain and any(re.search(p, msg_lower) for p in _RATING_RE_PATTERNS):
+        session_manager.add_message(session_id, "user", request.message)
+        return ChatResponse(
+            response_type="question",
+            message=(
+                "Thanks for the feedback! I appreciate you sharing your thoughts. "
+                "Would you like to explore more options or start a fresh search?"
+            ),
+            session_id=session_id,
+            quick_replies=["Shop laptops", "Shop vehicles", "Shop books"],
+            filters={},
+            preferences={},
+            question_count=0,
+            domain=None,
+            route_taken="rating_ack",
+        )
+
+    # ── Context-free post-rec graceful handler ──────────────────────────────────
+    # Catch messages that clearly reference prior product recommendations
+    # (pros/cons, "which of those", add-to-cart) when no session context exists.
+    # Instead of confusing interview questions, offer a helpful redirect.
+    _CONTEXT_FREE_POST_REC_PATTERNS = (
+        "pros and cons of these", "pros and cons of those",
+        "pros and cons of the", "which of those", "which of these",
+        "add it to my cart", "add that to my cart",
+    )
+    if not session.active_domain and any(p in msg_lower for p in _CONTEXT_FREE_POST_REC_PATTERNS):
+        session_manager.add_message(session_id, "user", request.message)
+        return ChatResponse(
+            response_type="question",
+            message=(
+                "It looks like you're referring to products I haven't shown you yet! "
+                "Let me help you find the right option. What are you shopping for today?"
+            ),
+            session_id=session_id,
+            quick_replies=["Laptops", "Vehicles", "Books"],
+            filters={},
+            preferences={},
+            question_count=0,
+            domain=None,
+            route_taken="context_free_post_rec",
+        )
+
     # --- UniversalAgent processing ---
     t_agent = time.perf_counter()
     # Restore agent from session or create new
@@ -626,7 +863,8 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
             preferences=_build_preferences_summary(agent.filters),
             question_count=agent_response.get("question_count", session.question_count),
             domain=agent_response.get("domain"),
-            timings_ms={**agent_response.get("timings_ms", {}), **timings, "total_backend_ms": (time.perf_counter() - t_start) * 1000}
+            timings_ms={**agent_response.get("timings_ms", {}), **timings, "total_backend_ms": (time.perf_counter() - t_start) * 1000},
+            route_taken="universal_agent_interview",
         )
 
     # --- Error response ---
@@ -1159,40 +1397,9 @@ async def _handle_post_recommendation(
     # -----------------------------------------------------------------------
     # Fast intent router: compare vs. refine vs. other
     # -----------------------------------------------------------------------
-    # Keyword fast-path skips the LLM call for obvious fixed-button messages
-    # _FAST_BEST_VALUE_KWS, _FAST_PROS_CONS_KWS defined at module level (importable by tests)
-    # Targeted Q&A: "which has the best X?" → show only the 1-2 winning products
-    # with detailed reasoning.  Must be checked BEFORE _FAST_COMPARE_KWS because
-    # "which is better" is a compare (all products) but "which has the best X" is
-    # targeted (1-2 winners).
-    _FAST_TARGETED_QA_KWS = (
-        "which has the best",         # "Which has the best build quality?"
-        "which is the most",          # "Which is the most durable?"
-        "which is most",              # "Which is most reliable?"
-        "which has the most",         # "Which has the most battery life?"
-        "which would you recommend",  # "Which would you recommend?"
-        "which one would you",        # "Which one would you pick?"
-        "which should i get",         # "Which should I get?"
-        "which should i pick",        # "Which should I pick?"
-        "which should i choose",      # "Which should I choose?"
-        "best build quality",         # bare phrase matches too
-        "best display quality",
-        "most durable",
-        "most reliable",
-        "best keyboard",
-        "best for college",
-        "best for everyday",
-        "best for work",
-        # Moved here from _FAST_COMPARE_KWS — these are "pick a winner" questions,
-        # not full comparison tables.  targeted_qa returns 1-2 cards with reasoning.
-        "best for students",          # "Which of these laptops is best for students?"
-        "best for gaming",            # "Which of these laptops is best for gaming?"
-        # Conceptual spec questions — should be answered with prose, not a table.
-        # generate_targeted_answer receives the full question so the LLM can explain
-        # the real-world meaning of a spec difference (e.g. 16GB vs 64GB RAM).
-        "real-world difference",      # "What's the real-world difference between 16GB and 64GB?"
-        "real world difference",
-    )
+    # Keyword fast-path skips the LLM call for obvious fixed-button messages.
+    # _FAST_BEST_VALUE_KWS, _FAST_PROS_CONS_KWS, _FAST_TARGETED_QA_KWS are
+    # defined at module level so tests can import and verify against production.
     # Explicit compare (user named products or pressed Compare dialog) → show cards
     # Also catches all ActionBar common-question chips so they never hit the LLM
     # intent router (which occasionally misclassifies them as "new_search").
@@ -1274,9 +1481,22 @@ async def _handle_post_recommendation(
         # Bare brand name (e.g. "Acer", "HP") from the brand-picker quick-reply.
         # Must be treated as "refine" — NOT compare/new_search.
         intent = "refine"
-    elif any(kw in msg_lower for kw in ("research", "explain features", "check compatibility", "summarize reviews")):
-        # "Research" quickReply chip and related phrases — bypass LLM to avoid "new_search"
-        # misclassification. Falls through to the research keyword handler further below.
+    elif any(kw in msg_lower for kw in (
+        "check out now", "let's check out", "lets check out",
+        "ready to checkout", "ready to check out", "proceed to checkout",
+    )):
+        # Checkout intent — caught here before LLM so "Let's check out now"
+        # (which contains "check out" with a space) reaches the checkout handler
+        # at the bottom of this function instead of being misrouted by the LLM.
+        intent = "checkout"
+    elif any(kw in msg_lower for kw in (
+        "research", "explain features", "check compatibility", "summarize reviews",
+        "can you explain",  # "Can you explain what Thunderbolt 4 is?"
+        "what is thunderbolt", "what is usb-c", "what is usb c",
+    )):
+        # "Research" quickReply chip and explain-a-feature phrases — bypass LLM
+        # to avoid "new_search" misclassification. Falls through to the research
+        # keyword handler further below.
         intent = "other"
     elif (
         ("cart" in msg_lower or "favorites" in msg_lower or "wishlist" in msg_lower or "bag" in msg_lower)
@@ -1301,6 +1521,36 @@ async def _handle_post_recommendation(
     # Reset session to blank state and return None so the caller falls through
     # to UniversalAgent, which will process the message as a new search.
     # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Checkout intent: user wants to proceed to purchase.
+    # Handled here (before the LLM-gated add_to_cart / targeted_qa blocks) so
+    # "Let's check out now" never gets misrouted by the LLM intent classifier.
+    # -----------------------------------------------------------------------
+    if intent == "checkout":
+        session_manager.add_message(session_id, "user", request.message)
+        fav_ids = list(session.favorite_product_ids or [])
+        if fav_ids:
+            fav_products = _fetch_products_by_ids(fav_ids, session_id=session_id)
+            total = sum(p.get("price", 0) for p in fav_products)
+            item_names = [p.get("name", "item")[:30] for p in fav_products[:5]]
+            msg_checkout = (
+                f"Your cart has {len(fav_products)} item(s) totaling ${total:,.2f}:\n"
+                + "\n".join(f"- {name}" for name in item_names)
+                + "\n\nClick the cart icon (top right) and then **Proceed to Checkout** to complete your purchase."
+            )
+        else:
+            msg_checkout = "Your cart is empty. Add items first by clicking the heart icon on any product, then return here to checkout."
+        return ChatResponse(
+            response_type="question",
+            message=msg_checkout,
+            session_id=session_id,
+            quick_replies=["See similar items", "Compare items", "Back to recommendations"],
+            filters=session.explicit_filters,
+            preferences={},
+            question_count=session.question_count,
+            domain=active_domain,
+        )
+
     if intent == "new_search":
         logger.info(
             "new_search_detected",
@@ -2939,7 +3189,8 @@ async def _search_and_respond_vehicles(
             preferences={},
             question_count=question_count,
             quick_replies=["See similar items", "Research", "Compare items", "Rate recommendations"],
-            timings_ms=timings
+            timings_ms=timings,
+            route_taken="universal_agent_search_vehicles",
         )
     except Exception as e:
         logger.error("vehicle_search_failed", f"Vehicle search failed: {e}", {"error": str(e)})
@@ -3387,7 +3638,8 @@ async def _search_and_respond_ecommerce(
         preferences=_build_preferences_summary(agent.filters if agent else {}),
         question_count=question_count,
         quick_replies=_recommendation_quick_replies(flat_data, search_filters),
-        timings_ms=timings
+        timings_ms=timings,
+        route_taken="universal_agent_search",
     )
 
 

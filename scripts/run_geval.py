@@ -3594,6 +3594,7 @@ async def run_geval_async(
     group_filter: Optional[str] = None,
     extra_queries_path: Optional[str] = None,
     no_kg: bool = False,
+    max_id: Optional[int] = None,
 ) -> List[Dict]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -3623,6 +3624,8 @@ async def run_geval_async(
         queries = [q for q in queries if q["id"] in selected_ids]
     if group_filter:
         queries = [q for q in queries if q.get("group") == group_filter]
+    if max_id is not None:
+        queries = [q for q in queries if q["id"] <= max_id]
 
     total = len(queries)
     group_label = f"  Group: {group_filter}" if group_filter else ""
@@ -3918,6 +3921,8 @@ def main():
                         help="Agent base URL (default: http://localhost:8000)")
     parser.add_argument("--query", type=int, action="append", dest="queries", metavar="N",
                         help="Run only query with this ID (repeatable)")
+    parser.add_argument("--max-id", type=int, metavar="N",
+                        help="Only run queries with ID <= N (e.g. --max-id 180 for IDs 1-180)")
     parser.add_argument("--group", metavar="GROUP",
                         help=(
                             "Run only queries in this group. Core groups: "
@@ -3961,6 +3966,7 @@ def main():
         group_filter=args.group,
         extra_queries_path=args.extra_queries,
         no_kg=no_kg,
+        max_id=args.max_id,
     ))
 
 

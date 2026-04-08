@@ -8,6 +8,8 @@ from agent.chat_endpoint import (
     _compute_diversity_score,
     _diversify_by_brand,
     _handle_post_recommendation,
+    _detect_faq_category,
+    _FAST_TARGETED_QA_KWS,
 )
 from agent.interview.session_manager import InterviewSessionState, STAGE_RECOMMENDATIONS
 
@@ -324,3 +326,100 @@ def test_see_similar_kg_exception_falls_back_gracefully():
 
     assert resp is not None  # no unhandled exception
     assert resp.response_type in ("recommendations", "question")
+
+
+# ---------------------------------------------------------------------------
+# Part 2: Service/FAQ question detection (_detect_faq_category)
+# Verifies that return-policy, shipping, warranty, and RAM-upgrade questions
+# are correctly classified before being handed off to the LLM for answering.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("msg,expected_cat", [
+    # Return policy
+    ("What is the return policy if I don't like the laptop after buying it?", "return"),
+    ("Can I return it if it doesn't work?", "return"),
+    ("How do I get a refund?", "return"),
+    # Shipping
+    ("How long does shipping usually take? I'm in California.", "shipping"),
+    ("When will it arrive if I order today?", "shipping"),
+    ("What's the estimated delivery time?", "shipping"),
+    # Warranty — accidental damage
+    ("If I accidentally spill coffee on it, does the warranty cover that?", "warranty"),
+    ("Does the warranty cover accidental damage?", "warranty"),
+    ("What does the extended protection cover?", "warranty"),
+    # RAM upgrade
+    ("If I buy a laptop now with 16GB, can I upgrade the RAM to 32GB myself later?", "upgrade"),
+    ("Can I upgrade the RAM later?", "upgrade"),
+    ("Is the RAM soldered or socketed?", "upgrade"),
+])
+def test_faq_category_detection(msg, expected_cat):
+    """_detect_faq_category must correctly classify all four FAQ categories."""
+    result = _detect_faq_category(msg.lower())
+    assert result == expected_cat, (
+        f"Expected category {expected_cat!r} for: {msg!r}, got {result!r}"
+    )
+
+
+def test_faq_category_none_for_product_queries():
+    """Regular product queries must NOT be misclassified as FAQ."""
+    non_faq = [
+        "I need a laptop under $800",
+        "Show me gaming laptops",
+        "Which is better, Dell or HP?",
+        "I want 16GB RAM and an RTX 4060",
+    ]
+    for msg in non_faq:
+        result = _detect_faq_category(msg.lower())
+        assert result is None, f"Unexpected FAQ category {result!r} for: {msg!r}"
+
+
+# ---------------------------------------------------------------------------
+# Part 3: Orchestrator routing fast-path keyword additions
+# Verifies the new entries in _FAST_TARGETED_QA_KWS and the checkout
+# fast-path keyword lists.
+# ---------------------------------------------------------------------------
+
+def test_which_of_those_has_is_in_targeted_qa_kws():
+    """'which of those has' must be in _FAST_TARGETED_QA_KWS (Q194 fix)."""
+    assert "which of those has" in _FAST_TARGETED_QA_KWS, (
+        "'which of those has' missing from _FAST_TARGETED_QA_KWS — "
+        "Q194 'Which of those has the best battery life?' will be misrouted."
+    )
+
+
+def test_which_of_them_has_is_in_targeted_qa_kws():
+    """'which of them has' must also be in _FAST_TARGETED_QA_KWS."""
+    assert "which of them has" in _FAST_TARGETED_QA_KWS
+
+
+@pytest.mark.parametrize("phrase", [
+    "Which of those has the best battery life?",
+    "Which of them has the longest battery?",
+    "Which one has the best keyboard?",
+])
+def test_targeted_qa_kws_match_anaphoric_battery_queries(phrase):
+    """Anaphoric 'which of those/them/one has the best X' must match the fast-path list."""
+    msg_lower = phrase.lower()
+    assert any(kw in msg_lower for kw in _FAST_TARGETED_QA_KWS), (
+        f"No targeted-QA keyword matched: {phrase!r}"
+    )
+
+
+@pytest.mark.parametrize("phrase", [
+    "let's check out now",
+    "lets check out",
+    "ready to check out",
+    "proceed to checkout",
+    "ready to checkout",
+])
+def test_checkout_phrases_match_fast_path_keywords(phrase):
+    """Checkout phrases must match the fast-path keyword list defined in
+    _handle_post_recommendation so they never reach the LLM intent classifier."""
+    _CHECKOUT_FAST_PATH_KWS = (
+        "check out now", "let's check out", "lets check out",
+        "ready to checkout", "ready to check out", "proceed to checkout",
+    )
+    msg_lower = phrase.lower()
+    assert any(kw in msg_lower for kw in _CHECKOUT_FAST_PATH_KWS), (
+        f"Checkout phrase not caught by fast-path: {phrase!r}"
+    )

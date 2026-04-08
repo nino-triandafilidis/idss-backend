@@ -1234,14 +1234,67 @@ class UniversalAgent:
             #     question mark are treated as rhetorical ("Is that even possible?" with a
             #     full spec list) — the agent should show alternatives, not ask another Q.
             #   - ≥4-word guard preserved to filter bare one-liners ("best laptop", "laptop").
-            if result.criteria and not result.wants_recommendations:
-                substantive = [c for c in result.criteria if c.slot_name not in ("os",)]
+            if not result.wants_recommendations:
+                substantive = [c for c in (result.criteria or []) if c.slot_name not in ("os",)]
                 msg_words = len(message.split())
                 has_question_mark = "?" in message
                 # Rhetorical: user listed ≥2 constraints + asked a question like
                 # "can any run Final Cut Pro?", "Is that possible?" — treat as req statement.
                 is_rhetorical = has_question_mark and len(substantive) >= 2
-                if (
+
+                # ── Browse / explicit-rec-request override ────────────────────
+                # Phrases like "What do you have for X?", "Show me all Y",
+                # "Do you have any Z?" signal a catalog-browse or explicit show-me
+                # intent.  They should always return recommendations regardless of
+                # how many formal slot constraints the LLM extracted.
+                # This fixes catalog_exploration and post_rec_refine groups where
+                # the has_question_mark gate was incorrectly blocking results.
+                _BROWSE_PATTERNS = (
+                    "what do you have", "what laptops do you have",
+                    "what books do you have", "what vehicles do you have",
+                    "show me all", "show me your", "show me gaming",
+                    "show me everything",
+                    "what's the cheapest", "what is the cheapest",
+                    "what are your top", "what are your best",
+                    "what are the top", "what are the best",
+                    "what are your most",
+                    "do you have any", "do you have some", "do you have something",
+                )
+                _EXPLICIT_REC_PATTERNS = (
+                    "show me",          # "Show me something cheaper / Macs / options"
+                    "can you show me",  # "Can you show me Macs instead?"
+                    "narrow those down",  # "Can you narrow those down?"
+                    "narrow it down",
+                    "narrow them down",
+                    "find me",
+                    "give me options",
+                    "give me some",
+                    "i want to see",    # "I want to see laptops with RTX 4070"
+                    "which would you pick",    # "If I needed a gaming laptop, which would you pick?"
+                    "which do you recommend",  # "Which do you recommend for an office user?"
+                    "any brand is fine",       # "forget the Mac preference — any brand is fine"
+                    "any brand works",
+                    "recommend me",
+                    "suggest me",
+                    "suggest a",
+                )
+                _msg_lower_h = message.lower()
+                _is_browse = any(p in _msg_lower_h for p in _BROWSE_PATTERNS)
+                _is_explicit_rec = any(p in _msg_lower_h for p in _EXPLICIT_REC_PATTERNS)
+
+                if (_is_browse or _is_explicit_rec) and msg_words >= 3:
+                    result.wants_recommendations = True
+                    # Default to laptops when no domain found — prevents fresh-session
+                    # refinements like "show me something cheaper" from falling through
+                    # to the domain=None → fallback question path.
+                    if not result.domain:
+                        result.domain = "laptops"
+                    logger.info(
+                        f"Browse/rec-request override "
+                        f"(browse={_is_browse}, explicit={_is_explicit_rec}) → "
+                        f"wants_recommendations=True, domain={result.domain}"
+                    )
+                elif (
                     len(substantive) >= 1
                     and msg_words >= 4
                     and (not has_question_mark or is_rhetorical)

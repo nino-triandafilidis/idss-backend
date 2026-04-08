@@ -463,7 +463,7 @@ async def score_gemini_quality_async(
             "prompt_tokens":     getattr(completion.usage, "prompt_tokens",     0) or 0,
             "completion_tokens": getattr(completion.usage, "completion_tokens", 0) or 0,
         }
-        raw = completion.choices[0].message.content.strip()
+        raw = (completion.choices[0].message.content or "").strip()
         # The judge outputs reasoning followed by a JSON line — take the last JSON line
         for line in reversed(raw.splitlines()):
             line = line.strip()
@@ -782,6 +782,8 @@ def main() -> None:
     parser.add_argument("--save",        help="Save JSON results to this path")
     parser.add_argument("--group",       help="Only run queries from this group")
     parser.add_argument("--query",       type=int, help="Only run this query ID")
+    parser.add_argument("--max-id",      type=int, metavar="N",
+                        help="Only run queries with ID <= N (e.g. --max-id 180)")
     parser.add_argument(
         "--concurrency", type=int, default=4,
         help="Max concurrent IDSS + Gemini calls (default 4; keep ≤4 on free tier)",
@@ -797,6 +799,8 @@ def main() -> None:
         queries = [q for q in queries if q["group"] == args.group]
     if args.query:
         queries = [q for q in queries if q["id"] == args.query]
+    if args.max_id is not None:
+        queries = [q for q in queries if q["id"] <= args.max_id]
 
     if not queries:
         print("No queries match given filters.")

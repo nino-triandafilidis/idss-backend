@@ -613,6 +613,8 @@ def main():
     parser.add_argument("--save",        help="Save JSON results to this path")
     parser.add_argument("--group",       help="Only run queries from this group")
     parser.add_argument("--query",       type=int, help="Only run this query ID")
+    parser.add_argument("--max-id",      type=int, metavar="N",
+                        help="Only run queries with ID <= N (e.g. --max-id 180)")
     parser.add_argument("--concurrency", type=int, default=4,
                         help="Max concurrent IDSS + GPT calls (default 4)")
     parser.add_argument("--verbose",     action="store_true",
@@ -624,6 +626,8 @@ def main():
         queries = [q for q in queries if q["group"] == args.group]
     if args.query:
         queries = [q for q in queries if q["id"] == args.query]
+    if args.max_id is not None:
+        queries = [q for q in queries if q["id"] <= args.max_id]
 
     if not queries:
         print("No queries match given filters.")
