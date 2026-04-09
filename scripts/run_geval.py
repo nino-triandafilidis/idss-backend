@@ -51,6 +51,7 @@ import json
 import os
 import sys
 import time
+import statistics
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -3595,6 +3596,7 @@ async def run_geval_async(
     extra_queries_path: Optional[str] = None,
     no_kg: bool = False,
     max_id: Optional[int] = None,
+    runs: int = 1,
 ) -> List[Dict]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -3651,9 +3653,7 @@ async def run_geval_async(
                           f"be unreliable for this query.{RST}")
         print()
 
-    # ── Phase 1: Collect agent responses in parallel ──────────────────────
-    print(f"{CYN}Phase 1/2: Querying agent ({CONCURRENCY} concurrent)...{RST}")
-
+    # ── Define async workers (reused across runs) ─────────────────────────
     async def query_one(q: Dict) -> Dict:
         session_id = str(uuid.uuid4())
         async with sem:
@@ -3669,14 +3669,7 @@ async def run_geval_async(
             elapsed = (time.perf_counter() - t0) * 1000
         return {"query": q, "response": resp, "elapsed_ms": round(elapsed)}
 
-    t_phase1 = time.perf_counter()
-    agent_results = await asyncio.gather(*[query_one(q) for q in queries])
-    phase1_elapsed = time.perf_counter() - t_phase1
-    print(f"  Done in {phase1_elapsed:.1f}s\n")
-
-    # ── Phase 2: Score all responses in parallel ───────────────────────────
-    print(f"{CYN}Phase 2/2: Scoring with LLM judge ({len(agent_results)} calls)...{RST}")
-
+    # ── Score worker (defined before loop so it's reused across runs) ────────
     async def score_one(item: Dict) -> Dict:
         q = item["query"]
         resp = item["response"]
@@ -3730,11 +3723,49 @@ async def run_geval_async(
             "completion_tokens": usage.get("completion_tokens", 0),
         }
 
-    t_phase2 = time.perf_counter()
-    scored = await asyncio.gather(*[score_one(item) for item in agent_results])
-    phase2_elapsed = time.perf_counter() - t_phase2
-    scored = sorted(scored, key=lambda r: r["id"])
-    print(f"  Done in {phase2_elapsed:.1f}s\n")
+    # ── Multi-run loop (PASS@k when runs > 1) ─────────────────────────────
+    all_runs: List[List[Dict]] = []
+    phase1_elapsed = 0.0
+    phase2_elapsed = 0.0
+
+    for _run_i in range(runs):
+        if runs > 1:
+            print(f"\n{CYN}── Run {_run_i + 1}/{runs} {'─' * 40}{RST}")
+        print(f"{CYN}Phase 1/2: Querying agent ({CONCURRENCY} concurrent)...{RST}")
+        _t1 = time.perf_counter()
+        agent_results = await asyncio.gather(*[query_one(q) for q in queries])
+        _elapsed1 = time.perf_counter() - _t1
+        phase1_elapsed += _elapsed1
+        print(f"  Done in {_elapsed1:.1f}s\n")
+
+        # ── Phase 2: Score all responses in parallel ───────────────────────
+        print(f"{CYN}Phase 2/2: Scoring with LLM judge ({len(agent_results)} calls)...{RST}")
+        _t2 = time.perf_counter()
+        _scored_run = await asyncio.gather(*[score_one(item) for item in agent_results])
+        _elapsed2 = time.perf_counter() - _t2
+        phase2_elapsed += _elapsed2
+        _scored_run = sorted(_scored_run, key=lambda r: r["id"])
+        print(f"  Done in {_elapsed2:.1f}s\n")
+        all_runs.append(list(_scored_run))
+
+        if runs > 1:
+            _run_avg = sum(r["score"] for r in _scored_run) / len(_scored_run)
+            _run_pass = 100.0 * sum(1 for r in _scored_run if r["score"] >= PASS_THRESHOLD) / len(_scored_run)
+            print(f"  Run {_run_i + 1} summary: avg={_run_avg:.4f}  pass={_run_pass:.1f}%")
+
+    # ── Aggregate across runs ──────────────────────────────────────────────
+    if runs > 1:
+        scored = []
+        for _q_idx in range(len(all_runs[0])):
+            _run_scores = [all_runs[_r][_q_idx]["score"] for _r in range(runs)]
+            _passes = sum(1 for s in _run_scores if s >= PASS_THRESHOLD)
+            _base = dict(all_runs[-1][_q_idx])
+            _base["score"] = round(sum(_run_scores) / runs, 4)
+            _base["pass_at_k"] = round(_passes / runs, 4)
+            _base["per_run_scores"] = [round(s, 4) for s in _run_scores]
+            scored.append(_base)
+    else:
+        scored = all_runs[0]
 
     # ── Print per-query results ────────────────────────────────────────────
     print(f"{'─'*74}")
@@ -3882,6 +3913,43 @@ async def run_geval_async(
     print(f"  Agent latency: avg={avg_latency_ms:.0f}ms  p50={p50_ms}ms")
     print(f"  Total time: agent={phase1_elapsed:.1f}s + scoring={phase2_elapsed:.1f}s\n")
 
+    # ── PASS@k summary (multi-run only) ────────────────────────────────────
+    _pass_at_k_data: Optional[Dict] = None
+    if runs > 1:
+        _per_run_avgs = [
+            sum(all_runs[_r][_i]["score"] for _i in range(len(scored))) / len(scored)
+            for _r in range(runs)
+        ]
+        _per_run_pass = [
+            100.0 * sum(1 for _i in range(len(scored)) if all_runs[_r][_i]["score"] >= PASS_THRESHOLD) / len(scored)
+            for _r in range(runs)
+        ]
+        _macro_pass_at_k = sum(r.get("pass_at_k", 0.0) for r in scored) / len(scored)
+        print(f"\n{BOLD}  PASS@{runs} Robustness Summary:{RST}")
+        print(f"  {'─'*52}")
+        print(f"  {'Run':<6} {'Avg':>8}  {'Pass%':>7}")
+        print(f"  {'─'*52}")
+        for _ri, (_av, _pp) in enumerate(zip(_per_run_avgs, _per_run_pass)):
+            print(f"  Run {_ri+1:<2}  {_av:>8.4f}  {_pp:>6.1f}%")
+        print(f"  {'─'*52}")
+        _mean_avg = sum(_per_run_avgs) / runs
+        _sd_avg = statistics.stdev(_per_run_avgs) if runs > 1 else 0.0
+        _mean_pass = sum(_per_run_pass) / runs
+        _sd_pass = statistics.stdev(_per_run_pass) if runs > 1 else 0.0
+        print(f"  {'Mean':<6}  {_mean_avg:>8.4f} ± {_sd_avg:.4f}  {_mean_pass:>5.1f}% ± {_sd_pass:.1f}pp")
+        print(f"  Macro PASS@{runs} (avg per-query pass rate): {_macro_pass_at_k:.4f}")
+        print()
+        _pass_at_k_data = {
+            "runs": runs,
+            "macro_pass_at_k": round(_macro_pass_at_k, 4),
+            "per_run_avg": [round(a, 4) for a in _per_run_avgs],
+            "per_run_pass_pct": [round(p, 2) for p in _per_run_pass],
+            "mean_avg": round(_mean_avg, 4),
+            "sd_avg": round(_sd_avg, 4),
+            "mean_pass_pct": round(_mean_pass, 2),
+            "sd_pass_pct": round(_sd_pass, 2),
+        }
+
     # ── Save JSON ──────────────────────────────────────────────────────────
     if save_path:
         output = {
@@ -3896,6 +3964,7 @@ async def run_geval_async(
                 "long":          {"n": nl, "avg_score": round(al, 4), "pass_pct": round(pl, 1)},
                 "all":           {"n": na, "avg_score": round(aa, 4), "pass_pct": round(pa, 1)},
                 "type_accuracy": round(ta, 1),
+                **({"pass_at_k": _pass_at_k_data} if _pass_at_k_data else {}),
             },
             "cost": {
                 "judge_model": "gpt-4o-mini",
@@ -3938,6 +4007,10 @@ def main():
     parser.add_argument("--save", metavar="FILE", help="Save JSON results to file")
     parser.add_argument("--baseline", metavar="FILE",
                         help="Compare against baseline results JSON (shows delta)")
+    parser.add_argument("--runs", type=int, default=1, metavar="K",
+                        help="Run the full eval K independent times and report PASS@k "
+                             "robustness (default: 1 = single run, unchanged behaviour). "
+                             "Each run costs the same as one full eval. Recommended: --runs 5")
     parser.add_argument("--no-kg", action="store_true",
                         help="Tag this run as KG-disabled in saved JSON (kg_enabled=false). "
                              "To actually disable KG, start the backend without NEO4J_PASSWORD set.")
@@ -3967,6 +4040,7 @@ def main():
         extra_queries_path=args.extra_queries,
         no_kg=no_kg,
         max_id=args.max_id,
+        runs=args.runs,
     ))
 
 

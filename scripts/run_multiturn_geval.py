@@ -1490,6 +1490,18 @@ async def run_all_scenarios(
                         )
                         else None
                     ),
+                    # Per-scenario breakdown (S1–S10)
+                    "per_scenario": [
+                        {
+                            "id":     r["id"],
+                            "name":   r["name"],
+                            "score":  round(r["systems"][sys]["final_score"], 4) if sys in r["systems"] else None,
+                            "passed": r["systems"][sys].get("passed", False) if sys in r["systems"] else False,
+                            "judge_score":      round(r["systems"][sys].get("judge_score", 0), 4) if sys in r["systems"] else None,
+                            "constraint_score": round(r["systems"][sys].get("constraint_score", 0), 4) if sys in r["systems"] else None,
+                        }
+                        for r in all_results
+                    ],
                 }
                 for sys in systems
             },
@@ -1504,6 +1516,39 @@ async def run_all_scenarios(
         with open(save_path, "w") as f:
             json.dump(output, f, indent=2)
         print(f"\n  Saved to: {save_path}")
+
+    # ── Per-scenario breakdown table ──────────────────────────────────────
+    _sys_col = {
+        "idss": "IDSS", "gpt": "GPT+Cat", "gemini": "Gemini",
+        "sajjad": "BaselineB", "perplexity": "Pplx⚠",
+    }
+    _active = [s for s in systems if s != "perplexity"]
+    _col_w = 9
+    _name_w = 36
+    _hdr = f"  {'S#':<4} {'Scenario':<{_name_w}}" + "".join(f"  {_sys_col.get(s, s):>{_col_w}}" for s in _active)
+    print(f"\n{'='*74}")
+    print(f"  Per-Scenario Scores (all {len(all_results)} scenarios)")
+    print(f"{'='*74}")
+    print(_hdr)
+    print(f"  {'─'*74}")
+    for r in all_results:
+        _row = f"  S{r['id']:<3} {r['name']:<{_name_w}}"
+        for s in _active:
+            _sc = r["systems"].get(s, {}).get("final_score")
+            _passed = r["systems"].get(s, {}).get("passed", False)
+            if _sc is None:
+                _row += f"  {'N/A':>{_col_w}}"
+            else:
+                _mark = "✓" if _passed else "✗"
+                _row += f"  {_mark}{_sc:>{_col_w - 2}.3f}"
+        print(_row)
+    print(f"  {'─'*74}")
+    _mean_row = f"  {'---':<4} {'Mean':<{_name_w}}"
+    for s in _active:
+        _scores = [r["systems"][s]["final_score"] for r in all_results if s in r["systems"]]
+        _mean_row += f"  {(sum(_scores)/len(_scores)):>{_col_w}.3f}" if _scores else f"  {'N/A':>{_col_w}}"
+    print(_mean_row)
+    print()
 
     fallback = {
         "summary": {
