@@ -82,7 +82,7 @@ GREEN = "\033[92m"; RED = "\033[91m"; YEL = "\033[93m"; CYN = "\033[96m"
 BOLD  = "\033[1m";  DIM = "\033[2m";  RST = "\033[0m"
 
 PASS_THRESHOLD = 0.5
-GEMINI_MODEL   = "gemini-2.5-flash"   # "mini" tier — comparable to gpt-4o-mini
+GEMINI_MODEL   = "gemini-2.0-flash"   # production stable; comparable to gpt-4o-mini tier
 
 # ============================================================================
 # Scripted multi-turn scenarios
@@ -93,6 +93,7 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "id": 1,
         "name": "constraint_accumulation_4turn",
         "description": "User adds constraints one by one over 4 turns",
+        "category": "constraint_persistence",
         "turns": [
             "I need a laptop",
             "It's mainly for gaming — needs to handle modern AAA games",
@@ -126,6 +127,7 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "id": 2,
         "name": "mind_change_pivot_gaming_to_video",
         "description": "User starts with gaming, explicitly pivots to video editing",
+        "category": "intent_pivot",
         "turns": [
             "Show me gaming laptops",
             "Actually, I just started a freelance video editing business. I need something for that instead — not gaming.",
@@ -153,6 +155,7 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "id": 3,
         "name": "brand_exclusion_persistence_dell",
         "description": "Dell excluded in turn 1; subsequent turns must still exclude Dell",
+        "category": "brand_exclusion",
         "turns": [
             "Show me laptops — I don't want any Dell products",
             "What about something with a dedicated GPU for machine learning?",
@@ -180,6 +183,7 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "id": 4,
         "name": "vague_to_specific_college_cs",
         "description": "One-word first query, agent guides user to specific recommendation",
+        "category": "clarification",
         "turns": [
             "laptop",
             "for college, I'm a CS major — lots of coding and some data science",
@@ -207,6 +211,7 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "id": 5,
         "name": "comparison_request_with_follow_up",
         "description": "User requests comparison of shown products, then asks specific follow-up",
+        "category": "comparison",
         "turns": [
             "I need a business laptop under $1200",
             "Can you compare the top 2 options in more detail?",
@@ -233,6 +238,7 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "id": 6,
         "name": "price_refinement_downward",
         "description": "User refines price downward mid-conversation; new budget must apply",
+        "category": "budget_refinement",
         "turns": [
             "Show me the best laptops for software developers",
             "Those are too expensive. I need something under $700",
@@ -260,6 +266,7 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "id": 7,
         "name": "budget_increase_overwrite",
         "description": "User raises budget — must OVERWRITE not accumulate old budget",
+        "category": "budget_overwrite",
         "turns": [
             "MacBook recommendations under $1000",
             "I can stretch to $1400 if it makes a meaningful difference in performance",
@@ -290,6 +297,7 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "id": 8,
         "name": "exclusion_then_unexclude_hp",
         "description": "User excludes HP, then changes mind and asks for HP specifically",
+        "category": "exclusion_reversal",
         "turns": [
             "Show me laptops, no HP please",
             "Actually, HP is fine. I changed my mind about that.",
@@ -320,6 +328,7 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "id": 9,
         "name": "5turn_med_school_session",
         "description": "Full 5-turn realistic session for medical student",
+        "category": "long_session",
         "turns": [
             "I need a laptop for medical school",
             "Mainly for note-taking, reading PDFs, and some light research online",
@@ -355,6 +364,7 @@ MULTITURN_SCENARIOS: List[Dict] = [
         "id": 10,
         "name": "dense_first_turn_then_refinement",
         "description": "Many constraints in turn 1, then user refines and asks about refurbished",
+        "category": "dense_constraint",
         "turns": [
             "I want a lightweight laptop — under 4 lbs, 13 or 14 inch, at least 16GB RAM, no gaming aesthetics, professional look, under $1300",
             "Does it need to be brand new or can it be refurbished?",
@@ -934,17 +944,42 @@ def format_transcript(turn_results: List[Dict]) -> str:
 
 
 async def judge_transcript(
-    oai:           AsyncOpenAI,
-    scenario:      Dict,
-    turn_results:  List[Dict],
-    system_name:   str,
+    oai:              AsyncOpenAI,
+    scenario:         Dict,
+    turn_results:     List[Dict],
+    system_name:      str,
+    constraint_notes: Optional[List[str]] = None,
 ) -> Tuple[float, str, Dict[str, int]]:
+    """
+    Judge the full conversation transcript using GPT-4o-mini (temp=0, deterministic).
+
+    constraint_notes: pre-computed deterministic check results injected into the prompt
+    so the judge cannot hallucinate constraint failures that were already verified as passing.
+    Without this injection, the judge was systematically giving 0.0 when all constraints
+    were actually satisfied (root cause of the suspicious floor-effect scores).
+    """
     transcript = format_transcript(turn_results)
+
+    # Build constraint context block from pre-computed deterministic check results.
+    # If all checks pass, explicitly tell the judge so it doesn't score constraint
+    # satisfaction as 0/4 when products are demonstrably within budget and brand-correct.
+    constraint_ctx = ""
+    if constraint_notes:
+        ctx_lines = ["", "DETERMINISTIC CONSTRAINT CHECK RESULTS (pre-verified — use to calibrate score):"]
+        for note in constraint_notes:
+            ctx_lines.append(f"  {note}")
+        all_pass = all(n.startswith("✓") for n in constraint_notes)
+        if all_pass:
+            ctx_lines.append("ALL checks PASSED. Constraint Satisfaction MUST score ≥3 out of 4.")
+        else:
+            ctx_lines.append("Some checks FAILED (see ✗ above). Penalise constraint satisfaction accordingly.")
+        constraint_ctx = "\n".join(ctx_lines) + "\n"
+
     prompt = MULTITURN_JUDGE_USER.format(
         scenario_name=scenario["name"],
         quality_note=scenario["quality_note"],
         transcript=transcript,
-    )
+    ) + constraint_ctx
 
     _zero: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
     try:
@@ -1167,14 +1202,15 @@ def check_constraint_drift_all_turns(
 # ============================================================================
 
 async def run_all_scenarios(
-    scenarios:    List[Dict],
-    base_url:     str,
-    systems:      List[str],
-    save_path:    Optional[str],
-    verbose:      bool,
-    sajjad_url:   str = "http://localhost:9003",
-    pplx_key:     Optional[str] = None,
-    gemini_key:   Optional[str] = None,
+    scenarios:      List[Dict],
+    base_url:       str,
+    systems:        List[str],
+    save_path:      Optional[str],
+    verbose:        bool,
+    sajjad_url:     str   = "http://localhost:9003",
+    pplx_key:       Optional[str] = None,
+    gemini_key:     Optional[str] = None,
+    pass_threshold: float = PASS_THRESHOLD,
 ) -> Dict:
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
@@ -1284,24 +1320,27 @@ async def run_all_scenarios(
                         print(f"           User: {t['user'][:80]}")
                         print(f"           Asst: {t['assistant'][:120].replace(chr(10),' ')}")
 
-                # Judge full transcript
-                judge_score, judge_reason, judge_usage = await judge_transcript(
-                    oai, sc, turn_results, system
-                )
-                total_prompt_tokens     += judge_usage.get("prompt_tokens",     0)
-                total_completion_tokens += judge_usage.get("completion_tokens", 0)
-
-                # Deterministic constraint check (final-turn only — backward-compatible)
+                # Run deterministic checks FIRST so we can inject results into the judge prompt.
+                # Previously judge ran before checks → judge hallucinated 0/10 even when
+                # all constraints were satisfied, because it had no proof they were met.
                 constraint_score, constraint_notes = check_final_turn_constraints(sc, turn_results)
 
                 # Constraint drift rate — checks EVERY turn, not just the last.
                 # drift_result["drift_rate"] is None when no per_turn_constraints are defined.
                 drift_result = check_constraint_drift_all_turns(sc, turn_results)
 
+                # Judge full transcript — now receives constraint check results so it
+                # cannot score constraint satisfaction as 0 when products are verified correct.
+                judge_score, judge_reason, judge_usage = await judge_transcript(
+                    oai, sc, turn_results, system,
+                    constraint_notes=constraint_notes,
+                )
+                total_prompt_tokens     += judge_usage.get("prompt_tokens",     0)
+                total_completion_tokens += judge_usage.get("completion_tokens", 0)
+
                 # Combined final score: 45% judge + 55% constraint
-                # Higher constraint weight prevents judge hallucination (0.0 judge + 1.0 constraint = 0.55 → PASS)
                 final_score = 0.45 * judge_score + 0.55 * constraint_score
-                passed = final_score >= PASS_THRESHOLD
+                passed = final_score >= pass_threshold
 
                 drift_str = (f"{drift_result['drift_rate']:.3f}"
                              if drift_result["drift_rate"] is not None else "N/A")
@@ -1411,7 +1450,7 @@ async def run_all_scenarios(
     for sys in systems:
         scores = system_scores[sys]
         avg = sum(scores) / len(scores) if scores else 0.0
-        pass_n = sum(1 for s in scores if s >= PASS_THRESHOLD)
+        pass_n = sum(1 for s in scores if s >= pass_threshold)
         # Compute avg drift_rate across scenarios (skip None — no per_turn_constraints)
         drift_vals = [
             r["systems"][sys]["drift_rate"]
@@ -1434,15 +1473,14 @@ async def run_all_scenarios(
     cost_usd = (total_prompt_tokens * 0.150 + total_completion_tokens * 0.600) / 1_000_000
     print(f"\n  Judge cost: ${cost_usd:.4f} USD  ({total_prompt_tokens:,} prompt + {total_completion_tokens:,} completion tokens)")
 
-    # ── Save ───────────────────────────────────────────────────────────────
-    if save_path:
-        output = {
+    # ── Build output dict (always — needed for multi-run pass@K aggregation) ─
+    output = {
             "version":     "multiturn_geval_v2",
             "systems":     systems,
             "idss_url":    base_url,
             "sajjad_url":  sajjad_url if "sajjad" in systems else None,
             "n_scenarios": total,
-            "threshold":   PASS_THRESHOLD,
+            "threshold":   pass_threshold,
             "scoring": {
                 "judge_weight":      0.45,
                 "constraint_weight": 0.55,
@@ -1466,7 +1504,7 @@ async def run_all_scenarios(
             "summary": {
                 sys: {
                     "avg_score":  round(sum(system_scores[sys]) / max(1, len(system_scores[sys])), 4),
-                    "pass_count": sum(1 for s in system_scores[sys] if s >= PASS_THRESHOLD),
+                    "pass_count": sum(1 for s in system_scores[sys] if s >= pass_threshold),
                     "n":          len(system_scores[sys]),
                     # avg_drift_rate: mean over scenarios with per_turn_constraints defined.
                     # None means no scenarios had per_turn_constraints (unexpected).
@@ -1513,6 +1551,7 @@ async def run_all_scenarios(
             },
             "results": all_results,
         }
+    if save_path:
         with open(save_path, "w") as f:
             json.dump(output, f, indent=2)
         print(f"\n  Saved to: {save_path}")
@@ -1550,13 +1589,279 @@ async def run_all_scenarios(
     print(_mean_row)
     print()
 
-    fallback = {
-        "summary": {
-            s: {"avg_score": round(sum(system_scores[s]) / max(1, len(system_scores[s])), 4)}
-            for s in systems
+    return output
+
+
+# ============================================================================
+# Pass@K and category breakdown — multi-run aggregation
+# ============================================================================
+
+def compute_pass_at_k(
+    all_run_outputs: List[Dict],
+    systems:         List[str],
+    scenarios:       List[Dict],
+    threshold:       float,
+) -> Dict:
+    """
+    Compute pass@K statistics from K independent runs of run_all_scenarios().
+
+    For each (system, scenario): collect K final_scores, then compute:
+      pass_at_k   = fraction of K runs where score >= threshold
+      mean_score  = mean of K scores
+      sd_score    = std-dev of K scores (0.0 when K=1)
+
+    Aggregated per system:
+      macro_pass_at_k = mean of per-scenario pass_at_k values
+      mean_avg_score  = mean of per-scenario mean_scores
+      sd_avg_score    = std-dev of per-scenario mean_scores (scenario-level variance)
+
+    Returns: {system: {K, macro_pass_at_k, mean_avg_score, sd_avg_score,
+                        per_scenario: [{id, name, category, pass_at_k,
+                                        mean_score, sd_score, per_run_scores}]}}
+    """
+    import math as _math
+    import statistics as _stat
+    K = len(all_run_outputs)
+    result: Dict = {}
+
+    for sys_name in systems:
+        scenario_stats = []
+        for sc in scenarios:
+            sc_id = sc["id"]
+            scores: List[float] = []
+
+            # Collect this scenario's final_score from every run
+            for run_out in all_run_outputs:
+                for sc_r in run_out.get("results", []):
+                    if sc_r["id"] == sc_id and sys_name in sc_r.get("systems", {}):
+                        scores.append(sc_r["systems"][sys_name]["final_score"])
+
+            if not scores:
+                continue
+
+            n_sc = len(scores)
+            n_pass = sum(1 for s in scores if s >= threshold)
+            _sc_sd = _stat.stdev(scores) if n_sc > 1 else 0.0
+            scenario_stats.append({
+                "id":             sc_id,
+                "name":           sc["name"],
+                "category":       sc.get("category", "unknown"),
+                "pass_at_k":      round(n_pass / n_sc, 3),
+                "mean_score":     round(sum(scores) / n_sc, 4),
+                "sd_score":       round(_sc_sd, 4),
+                "se_score":       round(_sc_sd / _math.sqrt(n_sc) if n_sc > 1 else 0.0, 4),
+                "per_run_scores": [round(s, 4) for s in scores],
+            })
+
+        if not scenario_stats:
+            result[sys_name] = {"K": K, "macro_pass_at_k": 0.0, "mean_avg_score": 0.0,
+                                 "sd_avg_score": 0.0, "se_avg_score": 0.0, "per_scenario": []}
+            continue
+
+        macro = sum(s["pass_at_k"] for s in scenario_stats) / len(scenario_stats)
+        mean_avgs = [s["mean_score"] for s in scenario_stats]
+        n_sc_total = len(mean_avgs)
+        _sys_sd = _stat.stdev(mean_avgs) if n_sc_total > 1 else 0.0
+        result[sys_name] = {
+            "K":               K,
+            "macro_pass_at_k": round(macro, 4),
+            "mean_avg_score":  round(sum(mean_avgs) / n_sc_total, 4),
+            "sd_avg_score":    round(_sys_sd, 4),
+            "se_avg_score":    round(_sys_sd / _math.sqrt(n_sc_total) if n_sc_total > 1 else 0.0, 4),
+            "per_scenario":    scenario_stats,
         }
+
+    return result
+
+
+def compute_category_breakdown(
+    all_run_outputs: List[Dict],
+    systems:         List[str],
+    scenarios:       List[Dict],
+    threshold:       float,
+) -> Dict:
+    """
+    Group scenario scores by category across all K runs, per system.
+
+    Categories (from scenario["category"]):
+      constraint_persistence, intent_pivot, brand_exclusion, clarification,
+      comparison, budget_refinement, budget_overwrite, exclusion_reversal,
+      long_session, dense_constraint
+
+    Returns: {system: {category: {n_scenarios, n_evals, avg_score, pass_rate}}}
+    """
+    # Map category → list of scenario IDs
+    cat_to_ids: Dict[str, List[int]] = {}
+    for sc in scenarios:
+        cat = sc.get("category", "unknown")
+        cat_to_ids.setdefault(cat, []).append(sc["id"])
+
+    result: Dict = {}
+    for sys_name in systems:
+        cat_stats: Dict = {}
+        for cat, sc_ids in sorted(cat_to_ids.items()):
+            scores: List[float] = []
+            for run_out in all_run_outputs:
+                for sc_r in run_out.get("results", []):
+                    if sc_r["id"] in sc_ids and sys_name in sc_r.get("systems", {}):
+                        scores.append(sc_r["systems"][sys_name]["final_score"])
+
+            if scores:
+                cat_stats[cat] = {
+                    "n_scenarios": len(sc_ids),
+                    "n_evals":     len(scores),
+                    "avg_score":   round(sum(scores) / len(scores), 4),
+                    "pass_rate":   round(sum(1 for s in scores if s >= threshold) / len(scores), 4),
+                }
+        result[sys_name] = cat_stats
+
+    return result
+
+
+# Friendly display labels for system names used in printed tables
+_SYS_LABELS = {
+    "idss":       "IDSS",
+    "gpt":        "GPT+Cat",
+    "gemini":     "Gemini",
+    "sajjad":     "MrgSajjad",
+    "perplexity": "Pplx⚠",
+}
+
+
+def print_pass_at_k_table(
+    passatk:   Dict,
+    systems:   List[str],
+    K:         int,
+    threshold: float,
+) -> None:
+    """
+    Print per-scenario pass@K table with mean±SD for each system.
+    Shows which scenarios are borderline (low pass_at_k) and which are robust.
+    """
+    active = [s for s in systems if s in passatk]
+    col_w = 12
+
+    print(f"\n{'═'*80}")
+    print(f"  {BOLD}Pass@{K} Results  (threshold={threshold})  "
+          f"— fraction of {K} runs where score ≥ {threshold}{RST}")
+    print(f"{'═'*80}")
+
+    # Header
+    hdr = f"  {'Scenario':<36} {'Cat':<22}"
+    for s in active:
+        hdr += f"  {_SYS_LABELS.get(s, s):>{col_w}}"
+    print(hdr)
+    print(f"  {'─'*80}")
+
+    # Per-scenario rows
+    for sc_data in (passatk.get(active[0], {}).get("per_scenario", []) if active else []):
+        sc_id   = sc_data["id"]
+        sc_name = sc_data["name"][:34]
+        sc_cat  = sc_data.get("category", "")[:20]
+        row = f"  S{sc_id:<2} {sc_name:<34} {sc_cat:<22}"
+        for s in active:
+            per_sc = {d["id"]: d for d in passatk.get(s, {}).get("per_scenario", [])}
+            d = per_sc.get(sc_id)
+            if d is None:
+                row += f"  {'N/A':>{col_w}}"
+            else:
+                mean_s = d["mean_score"]
+                sd_s   = d["sd_score"]
+                pat_k  = d["pass_at_k"]
+                c = GREEN if pat_k >= 0.8 else (YEL if pat_k >= 0.4 else RED)
+                row += f"  {c}{pat_k:.1f}({mean_s:.3f}±{sd_s:.3f}){RST}"
+        print(row)
+
+    print(f"  {'─'*80}")
+
+    # Macro pass@K row
+    macro_row = f"  {'Macro Pass@'+str(K):<36} {'':<22}"
+    for s in active:
+        mp = passatk.get(s, {}).get("macro_pass_at_k", 0.0)
+        c = GREEN if mp >= 0.8 else (YEL if mp >= 0.4 else RED)
+        macro_row += f"  {c}{mp:>{col_w}.3f}{RST}"
+    print(macro_row)
+
+    # Mean avg score row (shows ±SE for paper tables)
+    avg_row = f"  {'Mean Avg Score':<36} {'':<22}"
+    for s in active:
+        ma = passatk.get(s, {}).get("mean_avg_score", 0.0)
+        se = passatk.get(s, {}).get("se_avg_score", 0.0)
+        avg_row += f"  {BOLD}{ma:.3f}±{se:.3f}(SE){RST}{' '*(col_w-16)}"
+    print(avg_row)
+    print()
+
+
+def print_category_table(
+    cat_breakdown: Dict,
+    systems:       List[str],
+) -> None:
+    """
+    Print per-category avg score and pass rate for each system.
+    Reveals which scenario types each system handles well vs. poorly.
+    """
+    active = [s for s in systems if s in cat_breakdown]
+    if not active:
+        return
+
+    # Collect all categories across systems
+    all_cats = sorted({cat for s in active for cat in cat_breakdown.get(s, {})})
+    col_w = 16
+
+    print(f"{'═'*80}")
+    print(f"  {BOLD}Category Breakdown  (avg score / pass%){RST}")
+    print(f"{'═'*80}")
+
+    hdr = f"  {'Category':<26}"
+    for s in active:
+        hdr += f"  {_SYS_LABELS.get(s, s):>{col_w}}"
+    print(hdr)
+    print(f"  {'─'*80}")
+
+    for cat in all_cats:
+        row = f"  {cat:<26}"
+        for s in active:
+            d = cat_breakdown.get(s, {}).get(cat)
+            if d is None:
+                row += f"  {'N/A':>{col_w}}"
+            else:
+                avg  = d["avg_score"]
+                pct  = d["pass_rate"] * 100
+                n_sc = d["n_scenarios"]
+                c = GREEN if pct >= 80 else (YEL if pct >= 50 else RED)
+                row += f"  {c}{avg:.3f}/{pct:4.0f}% (n={n_sc}){RST}"
+        print(row)
+
+    print(f"  {'─'*80}")
+    print()
+
+
+def build_merged_output(
+    all_run_outputs: List[Dict],
+    passatk:         Dict,
+    cat_breakdown:   Dict,
+    systems:         List[str],
+    threshold:       float,
+) -> Dict:
+    """
+    Merge K per-run result dicts into one summary JSON for saving.
+    Includes pass@K stats, category breakdown, and all raw per-run results.
+    """
+    K = len(all_run_outputs)
+    return {
+        "version":          "multiturn_geval_passatk_v1",
+        "K":                K,
+        "systems":          systems,
+        "threshold":        threshold,
+        "pass_at_k":        passatk,
+        "category_breakdown": cat_breakdown,
+        "per_run_summaries": [
+            r.get("summary", {}) for r in all_run_outputs
+        ],
+        "per_run_results": [
+            r.get("results", []) for r in all_run_outputs
+        ],
     }
-    return output if save_path else fallback
 
 
 # ============================================================================
@@ -1585,6 +1890,15 @@ def main():
                              "(default: idss,gpt)")
     parser.add_argument("--verbose",   action="store_true",
                         help="Print full turn text")
+    parser.add_argument("--runs",      type=int, default=1,
+                        help="Number of independent runs for pass@K statistics "
+                             "(default: 1 = single run, no pass@K). "
+                             "Recommend --runs 5 for reliable pass@5 reporting.")
+    parser.add_argument("--threshold", type=float, default=PASS_THRESHOLD,
+                        help=f"Pass threshold 0.0–1.0 (default: {PASS_THRESHOLD}). "
+                             "Recommend 0.65 for multi-turn to overcome the scoring floor: "
+                             "with constraint=1.0 and judge=0.0 the score is 0.55, so "
+                             "threshold=0.5 auto-passes all compliant systems regardless of quality.")
     args = parser.parse_args()
 
     valid_systems = {"idss", "gpt", "gemini", "perplexity", "sajjad"}
@@ -1596,22 +1910,58 @@ def main():
 
     scenarios = list(MULTITURN_SCENARIOS)
     if args.scenario:
-        scenarios = [s for s in scenarios if s["id"] == args.scenario]
+        scenarios = [sc for sc in scenarios if sc["id"] == args.scenario]
 
     if not scenarios:
         print("No scenarios match given filters.")
         sys.exit(1)
 
-    asyncio.run(run_all_scenarios(
-        scenarios=scenarios,
-        base_url=args.url,
-        systems=systems,
-        save_path=args.save,
-        verbose=args.verbose,
-        sajjad_url=args.sajjad_url,
-        pplx_key=args.perplexity_key,
-        gemini_key=args.gemini_key,
-    ))
+    threshold = args.threshold
+    K         = args.runs
+
+    if K > 1:
+        print(f"\n{BOLD}Multi-run mode: K={K}, threshold={threshold}{RST}")
+        print(f"  Will run all {len(scenarios)} scenario(s) × {len(systems)} system(s) "
+              f"× {K} run(s) = {len(scenarios)*len(systems)*K} total evaluations.")
+        if threshold <= PASS_THRESHOLD:
+            print(f"  {YEL}WARNING: threshold={threshold} ≤ scoring floor (0.55 when constraint=1.0, judge=0.0). "
+                  f"Consider --threshold 0.65 for more discriminating results.{RST}")
+
+    all_run_outputs: List[Dict] = []
+
+    for run_i in range(K):
+        if K > 1:
+            print(f"\n{'▓'*74}")
+            print(f"  RUN {run_i + 1} / {K}")
+            print(f"{'▓'*74}")
+        # Pass save_path=None for intermediate runs; we save the merged output at end.
+        # For a single run (K=1) we save directly via run_all_scenarios.
+        run_save = args.save if K == 1 else None
+        out = asyncio.run(run_all_scenarios(
+            scenarios=scenarios,
+            base_url=args.url,
+            systems=systems,
+            save_path=run_save,
+            verbose=args.verbose,
+            sajjad_url=args.sajjad_url,
+            pplx_key=args.perplexity_key,
+            gemini_key=args.gemini_key,
+            pass_threshold=threshold,
+        ))
+        all_run_outputs.append(out)
+
+    # After all runs: compute pass@K and category breakdown, print summary tables, save merged JSON.
+    if K > 1:
+        passatk       = compute_pass_at_k(all_run_outputs, systems, scenarios, threshold)
+        cat_breakdown = compute_category_breakdown(all_run_outputs, systems, scenarios, threshold)
+        print_pass_at_k_table(passatk, systems, K, threshold)
+        print_category_table(cat_breakdown, systems)
+
+        if args.save:
+            merged = build_merged_output(all_run_outputs, passatk, cat_breakdown, systems, threshold)
+            with open(args.save, "w") as f:
+                json.dump(merged, f, indent=2)
+            print(f"  Merged pass@{K} results saved to: {args.save}")
 
 
 if __name__ == "__main__":

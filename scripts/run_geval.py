@@ -49,8 +49,10 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
+import math
 import statistics
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -79,6 +81,7 @@ except ImportError:
 # ============================================================================
 # Metadata fields used for deterministic scoring:
 #   expect_recs_on_first: bool  — True if query has enough info for direct recs
+#   expect_explain: bool        — True if response should contain explanation bullets/attributes
 #   expect_question: bool       — True if agent must ask a clarifying question
 #   must_not_contain_brands: list — brand names that must not appear in recs
 #   expect_filters: list        — filter keys that must be extracted
@@ -95,6 +98,7 @@ QUERIES: List[Dict[str, Any]] = [
             "and weigh under 5 lbs for carrying to lab."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -109,6 +113,7 @@ QUERIES: List[Dict[str, Any]] = [
             "512GB storage, good battery, and a budget of $1,500."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -123,6 +128,7 @@ QUERIES: List[Dict[str, Any]] = [
             "32GB RAM, 8+ hours battery, and cost under $1,500."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -137,6 +143,7 @@ QUERIES: List[Dict[str, Any]] = [
             "RAM, and cost under $700."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -151,6 +158,7 @@ QUERIES: List[Dict[str, Any]] = [
             "budget between $2,000 and $2,500."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -208,7 +216,8 @@ QUERIES: List[Dict[str, Any]] = [
             "I want RTX 4090, 64GB RAM, 4K OLED display, 20-hour battery, "
             "weighs 2 lbs, under $800. Is that possible?"
         ),
-        "expect_recs_on_first": True,  # has enough info; agent should show closest alternatives
+        "expect_recs_on_first": True,
+        "expect_explain": True,  # has enough info; agent should show closest alternatives
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -235,7 +244,8 @@ QUERIES: List[Dict[str, Any]] = [
             "maybe 16GB but then can I still run Blender? Idk just find me "
             "something good under $1,200"
         ),
-        "expect_recs_on_first": True,  # has budget + use case
+        "expect_recs_on_first": True,
+        "expect_explain": True,  # has budget + use case
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -276,6 +286,7 @@ QUERIES: List[Dict[str, Any]] = [
             "budget $1,800, what should i get him"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -303,6 +314,7 @@ QUERIES: List[Dict[str, Any]] = [
             "my budget is $1400 not $1600. are there alternatives with same iGPU TDP?"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -371,6 +383,7 @@ QUERIES: List[Dict[str, Any]] = [
             "what's the absolute best possible laptop money can buy right now"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -412,6 +425,7 @@ QUERIES: List[Dict[str, Any]] = [
             "developer-grade, under $1,200 each"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -426,6 +440,7 @@ QUERIES: List[Dict[str, Any]] = [
             "heard bad things. budget $900, 16GB RAM"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["HP", "Acer"],
         "expect_filters": ["excluded_brands", "budget", "min_ram_gb"],
@@ -439,6 +454,7 @@ QUERIES: List[Dict[str, Any]] = [
             "16GB RAM, SSD, under $1,000"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -466,6 +482,7 @@ QUERIES: List[Dict[str, Any]] = [
             "in-stock only. $700 budget. student"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -546,6 +563,7 @@ QUERIES: List[Dict[str, Any]] = [
             "maybe drop-proof? spill-proof? hospital wifi. under $800"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -559,6 +577,7 @@ QUERIES: List[Dict[str, Any]] = [
             "youtube, needs to survive being thrown in a backpack. $500 max"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -573,6 +592,7 @@ QUERIES: List[Dict[str, Any]] = [
             "that for AI image gen. 16GB RAM total, under $1,500"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget", "min_ram_gb"],
@@ -586,6 +606,7 @@ QUERIES: List[Dict[str, Any]] = [
             "under $1,000 for video editing"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -651,6 +672,7 @@ QUERIES: List[Dict[str, Any]] = [
             "compare them? I want to understand the tradeoffs."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -675,6 +697,7 @@ QUERIES: List[Dict[str, Any]] = [
             "category, around $1,000 to $1,500?"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -686,6 +709,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Too expensive — video editing under $800",
         "message": "These are all too expensive. I need something under $800 that still does video editing.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -706,6 +730,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Changed mind — now wants HP, 16GB, under $1000",
         "message": "Actually forget what I said, I changed my mind. Show me HP laptops with 16GB RAM under $1,000.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget", "min_ram_gb"],
@@ -717,6 +742,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Gaming, 16GB RAM, $1000–$1500 range",
         "message": "Gaming laptop, 16GB RAM. My budget is between $1,000 and $1,500.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -743,6 +769,7 @@ QUERIES: List[Dict[str, Any]] = [
             "if it's genuinely worth it. I work in data science and run ML models."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget", "min_ram_gb"],
@@ -754,6 +781,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "ASUS only, best gaming under $1500",
         "message": "I only want ASUS. What's the best ASUS gaming laptop under $1,500?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["HP", "Dell", "Lenovo", "Acer"],
         "expect_filters": ["budget"],
@@ -767,6 +795,7 @@ QUERIES: List[Dict[str, Any]] = [
             "under $1,200. No HP, no Acer please."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["HP", "Acer"],
         "expect_filters": ["budget", "min_ram_gb"],
@@ -795,6 +824,7 @@ QUERIES: List[Dict[str, Any]] = [
             "thermal performance so it doesn't throttle during recording. Budget $2,000."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -808,6 +838,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Need at least 15-inch display, dedicated GPU, 32GB RAM, fast SSD, under $2,000."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -822,6 +853,7 @@ QUERIES: List[Dict[str, Any]] = [
             "under $1,200."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -836,6 +868,7 @@ QUERIES: List[Dict[str, Any]] = [
             "for my teenager. $600 budget. Can it ship in time?"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -849,6 +882,7 @@ QUERIES: List[Dict[str, Any]] = [
             "in 2 days and need a replacement immediately. $800 budget."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -864,6 +898,7 @@ QUERIES: List[Dict[str, Any]] = [
             "RAW files in Lightroom. Budget $1,800."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -878,6 +913,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Nothing complicated. Budget around $300-$400."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -892,6 +928,7 @@ QUERIES: List[Dict[str, Any]] = [
             "but it also needs an RTX 4090 GPU and 20+ hours of battery. Does that exist?"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -902,6 +939,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "4K OLED + 16h battery + under $600 — all required",
         "message": "Need a laptop with 4K OLED display, 16 hours battery life, under $600. All three are hard requirements.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -917,6 +955,7 @@ QUERIES: List[Dict[str, Any]] = [
             "$600 budget"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -931,6 +970,7 @@ QUERIES: List[Dict[str, Any]] = [
             "that will stay fast for years. under $700"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -966,6 +1006,7 @@ QUERIES: List[Dict[str, Any]] = [
             "must have a backlit keyboard, budget $700."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -979,6 +1020,7 @@ QUERIES: List[Dict[str, Any]] = [
             "144Hz display, no HP brand, budget $1,600."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["HP"],
         "expect_filters": ["min_ram_gb", "budget", "excluded_brands"],
@@ -992,6 +1034,7 @@ QUERIES: List[Dict[str, Any]] = [
             "12 hours battery, and a price under $900."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1005,6 +1048,7 @@ QUERIES: List[Dict[str, Any]] = [
             "5 lbs, budget $1,800."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1018,6 +1062,7 @@ QUERIES: List[Dict[str, Any]] = [
             "10+ hours battery, all under $600."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1031,6 +1076,7 @@ QUERIES: List[Dict[str, Any]] = [
             "no Lenovo and no Acer, budget $1,400."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["Lenovo", "Acer"],
         "expect_filters": ["min_ram_gb", "budget", "excluded_brands"],
@@ -1044,6 +1090,7 @@ QUERIES: List[Dict[str, Any]] = [
             "budget $1,100."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1109,6 +1156,7 @@ QUERIES: List[Dict[str, Any]] = [
             "all day in class, and need at least 8 hours battery. Budget $800."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1122,6 +1170,7 @@ QUERIES: List[Dict[str, Any]] = [
             "and some gaming on weekends. 16GB RAM, budget $900."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1135,6 +1184,7 @@ QUERIES: List[Dict[str, Any]] = [
             "illustration. Color accuracy matters. Budget $1,200."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1148,6 +1198,7 @@ QUERIES: List[Dict[str, Any]] = [
             "This is my first laptop ever. Budget is $350."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1161,6 +1212,7 @@ QUERIES: List[Dict[str, Any]] = [
             "travel between campuses, need good build quality. Budget $1,100."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1175,6 +1227,7 @@ QUERIES: List[Dict[str, Any]] = [
             "which specific ROG model is the best one under $1,500."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["HP", "Dell", "Lenovo", "Acer"],
         "expect_filters": ["budget"],
@@ -1188,6 +1241,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Which one should I buy for a software developer who travels a lot?"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -1201,6 +1255,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Just confirm this is a fair price for a gaming laptop and I'll go for it."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1214,6 +1269,7 @@ QUERIES: List[Dict[str, Any]] = [
             "with 16GB RAM and an SSD. I'll buy it today."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1269,6 +1325,7 @@ QUERIES: List[Dict[str, Any]] = [
             "32GB RAM, and budget $2,000."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1282,6 +1339,7 @@ QUERIES: List[Dict[str, Any]] = [
             "fast CPU, SSD. No dedicated GPU needed. Budget $1,500."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1295,6 +1353,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Needs to not choke on large extracts. 16GB RAM, budget $1,200."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1308,6 +1367,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Light workload otherwise. Budget $800."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1321,6 +1381,7 @@ QUERIES: List[Dict[str, Any]] = [
             "fast SSD for compiling Swift projects. Budget $1,800."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1335,6 +1396,7 @@ QUERIES: List[Dict[str, Any]] = [
             "RTX 4060 is fine for that. Best value RTX 4060 gaming laptop under $1,200."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1348,6 +1410,7 @@ QUERIES: List[Dict[str, Any]] = [
             "I don't need a powerful GPU. 8GB RAM, budget $500."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1361,6 +1424,7 @@ QUERIES: List[Dict[str, Any]] = [
             "I heard you need at least an RTX 4070. Budget $1,800."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1374,6 +1438,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Thin bezels preferred. Budget $1,400."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1389,6 +1454,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Same model for easy IT management."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1402,6 +1468,7 @@ QUERIES: List[Dict[str, Any]] = [
             "thin and light, excellent battery, top-tier display. Budget $2,500."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1415,6 +1482,7 @@ QUERIES: List[Dict[str, Any]] = [
             "for remote management. Budget $1,200 per unit."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1428,6 +1496,7 @@ QUERIES: List[Dict[str, Any]] = [
             "for staff doing document work and Zoom calls. Budget $400 each."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1483,6 +1552,7 @@ QUERIES: List[Dict[str, Any]] = [
             "It's a corporate security requirement. Budget $1,100."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1604,6 +1674,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Need RTX 4080, 32GB RAM, OLED or high color-gamut display. Budget $3,000."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1617,6 +1688,7 @@ QUERIES: List[Dict[str, Any]] = [
             "lots of RAM and multi-core CPU. Need 64GB RAM, Linux-native support, budget $2,500."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1630,6 +1702,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Need RTX 4070 minimum, 32GB RAM, fast NVMe SSD. Budget $2,000."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1644,6 +1717,7 @@ QUERIES: List[Dict[str, Any]] = [
             "fast NVMe SSD, budget $2,500."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1675,6 +1749,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "ALL CAPS slow laptop, needs upgrade $400",
         "message": "MY LAPTOP IS SO SLOW IT TAKES 10 MIN TO OPEN CHROME I NEED A NEW ONE UNDER $400",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1689,6 +1764,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Is that actually a good recommendation for gaming under $1,400?"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1715,6 +1791,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Which laptops in your store have that GPU for under $1,800?"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1729,6 +1806,7 @@ QUERIES: List[Dict[str, Any]] = [
             "I have $1,200 and it needs to last all 4 years of college."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1793,6 +1871,7 @@ QUERIES: List[Dict[str, Any]] = [
             "17-inch display, maximum power. I don't care about battery or weight. Budget $1,800."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1847,6 +1926,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Is that still true? Budget $1,500."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1860,6 +1940,7 @@ QUERIES: List[Dict[str, Any]] = [
             "More GHz means more FPS right? Budget $1,200."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1873,6 +1954,7 @@ QUERIES: List[Dict[str, Any]] = [
             "that's enough. Just need a laptop with 8GB. Budget $900."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -1889,6 +1971,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Compare two laptops cold (no prior session)",
         "message": "Can you compare the Dell XPS 15 vs the MacBook Pro 16 for software development?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -1906,6 +1989,7 @@ QUERIES: List[Dict[str, Any]] = [
             "HP Spectre x360, or ASUS ZenBook 14?"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -1919,6 +2003,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Compare MacBook vs Windows cold with budget",
         "message": "For $1500, is the MacBook Air M3 or a Windows laptop a better buy for med school?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -1932,6 +2017,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Indirect comparison ('better than') phrasing",
         "message": "Is the Dell XPS 13 better than the MacBook Air M2 for everyday use?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -1945,6 +2031,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Compare + exclude brand in one sentence",
         "message": "Compare gaming laptops under $1500 — exclude ASUS, just Dell or Lenovo.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["ASUS"],
         "expect_filters": ["budget", "excluded_brands"],
@@ -2013,6 +2100,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Purchase intent mid-spec message",
         "message": "I need a 16GB RAM laptop under $1000 — and once you recommend one I want to buy it right away.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["min_ram_gb", "budget"],
@@ -2028,6 +2116,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Over $X budget (minimum spend, not maximum)",
         "message": "I want to spend over $1500 on a laptop — I want something premium.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2042,6 +2131,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "'At least $1000' spend signal",
         "message": "I'm willing to spend at least $1000 on a good laptop for work.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2055,6 +2145,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "No budget but very high-spec ask",
         "message": "I want the absolute best laptop for machine learning — money is no object.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2068,6 +2159,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Budget stated as 'around' with range ambiguity",
         "message": "I'm looking at around $800-$900 for a lightweight laptop for travel.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2081,6 +2173,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Price anchored to competitor product",
         "message": "I don't want to spend more than a MacBook Air — so under $1100 please. No Mac though.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["Apple"],
         "expect_filters": ["budget", "excluded_brands"],
@@ -2099,6 +2192,7 @@ QUERIES: List[Dict[str, Any]] = [
             "budget $1800 for 3D modeling."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["HP", "Acer"],
         "expect_filters": ["min_ram_gb", "budget", "excluded_brands"],
@@ -2115,6 +2209,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Also, what's the difference between SSD and HDD?"
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2129,6 +2224,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Negation of spec ('no Intel CPU') as filter",
         "message": "I want a laptop with no Intel CPU — AMD Ryzen only. Budget $1000.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2145,6 +2241,7 @@ QUERIES: List[Dict[str, Any]] = [
             "If possible I'd like 16GB RAM, but 8GB is fine too."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2159,6 +2256,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Question phrased as a spec ('can it do X?') not a search",
         "message": "Can the laptops in this price range run Blender for 3D modeling? Budget $1500.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2184,6 +2282,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Gaming RTX 4090 under $150 — catalog impossible",
         "message": "I need a gaming laptop with an RTX 4090 GPU. My budget is $150.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2200,6 +2299,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "64GB RAM under $250 — catalog impossible",
         "message": "I need a laptop with at least 64GB of RAM. My budget is $250.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget", "min_ram_gb"],
@@ -2216,6 +2316,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Any laptop under $50 — catalog impossible",
         "message": "What laptop can I get for $50 or less? That's my entire budget.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2235,6 +2336,7 @@ QUERIES: List[Dict[str, Any]] = [
             "Must have 32GB RAM and NVIDIA RTX 4080 GPU. Budget is $200 maximum."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget", "min_ram_gb"],
@@ -2254,6 +2356,7 @@ QUERIES: List[Dict[str, Any]] = [
             "I only want options from other brands."
         ),
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["HP", "Dell", "Lenovo", "ASUS", "Acer", "Apple"],
         "expect_filters": [],
@@ -2270,6 +2373,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Nonexistent brand 'Futura' — catalog impossible",
         "message": "I love Futura laptops — I've heard great things about their build quality. Can you show me Futura laptop options?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2286,6 +2390,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "128GB RAM under $400 — catalog impossible",
         "message": "I need a laptop with 128GB of RAM for running large AI models locally. My budget is $400.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget", "min_ram_gb"],
@@ -2302,6 +2407,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Gaming laptop under $200 with 16GB RAM — catalog impossible",
         "message": "I want a gaming laptop with 16GB RAM. My strict budget is $200 — I can't go over that.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget", "min_ram_gb"],
@@ -2336,6 +2442,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Refine previous results by brand",
         "message": "Only show me Dell laptops from those options",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["Apple", "HP", "Lenovo", "ASUS"],
         "expect_filters": ["brand"],
@@ -2349,6 +2456,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Start over with different domain",
         "message": "Forget the laptops — show me gaming desktops instead",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2401,6 +2509,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Ask for similar items to one shown",
         "message": "Show me something similar to the first option but lighter",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2427,6 +2536,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Ambiguous follow-up — could be compare or refine",
         "message": "What about something with more storage?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2466,6 +2576,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "New search after seeing results",
         "message": "Actually let me start fresh — I need a laptop for my mom who mostly uses email",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2484,6 +2595,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Brand + budget + RAM constraint",
         "message": "I need a Dell laptop under $800 with at least 16GB RAM",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["Apple", "HP", "Lenovo", "ASUS"],
         "expect_filters": ["brand", "budget", "min_ram_gb"],
@@ -2498,6 +2610,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "No gaming + student budget",
         "message": "I need a laptop for studying, nothing gaming-related, under $600",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2512,6 +2625,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Exclude multiple brands + screen size + budget",
         "message": "Looking for a 15-inch laptop under $1000. Please no Lenovo or ASUS.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["Lenovo", "ASUS"],
         "expect_filters": ["budget"],
@@ -2526,6 +2640,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "OS + RAM + brand constraint",
         "message": "I need a Windows laptop from Dell or HP with at least 32GB RAM",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["Apple"],
         "expect_filters": ["min_ram_gb"],
@@ -2539,6 +2654,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Max weight + battery + budget",
         "message": "I travel constantly. Need something under $1200, light (under 3 lbs), and good battery",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2553,6 +2669,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "GPU + RAM + budget for ML",
         "message": "Machine learning workstation laptop: RTX 4060 or better, 32GB RAM minimum, budget $2000",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget", "min_ram_gb"],
@@ -2567,6 +2684,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "No HP + no refurbished + under $700",
         "message": "I need a new (not refurbished) laptop under $700, nothing from HP",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["HP"],
         "expect_filters": ["budget"],
@@ -2581,6 +2699,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "SSD + brand + budget combo",
         "message": "Dell or Lenovo laptop with SSD storage under $900",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["Apple", "HP", "ASUS"],
         "expect_filters": ["budget"],
@@ -2595,6 +2714,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Screen size + use-case + budget",
         "message": "Need a 17-inch laptop for video editing, my budget is $1500",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2609,6 +2729,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Four simultaneous constraints",
         "message": "ASUS laptop under $800 with 16GB RAM and 512GB SSD or larger",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["Apple", "Dell", "HP", "Lenovo"],
         "expect_filters": ["brand", "budget", "min_ram_gb"],
@@ -2680,6 +2801,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Non-technical user with vague need",
         "message": "I just need something that doesn't freeze and can run Zoom",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2737,6 +2859,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Show me all options under $500",
         "message": "What laptops do you have under $500?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2751,6 +2874,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Browse by brand",
         "message": "Show me all the MacBook options you have",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2764,6 +2888,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Show options for a specific use-case",
         "message": "What do you have for video editing?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2777,6 +2902,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Explore gaming laptops in a price band",
         "message": "Show me gaming laptops between $800 and $1200",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2791,6 +2917,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "What's the cheapest laptop available",
         "message": "What's the cheapest laptop you have?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2804,6 +2931,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Top-rated laptops in catalog",
         "message": "What are your top-rated laptops?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2817,6 +2945,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Browse ultrabooks category",
         "message": "Do you have any ultrabooks or thin-and-light laptops?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2830,6 +2959,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Show laptops with specific GPU",
         "message": "I want to see laptops with RTX 4070 or RTX 4080",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2931,6 +3061,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Cheaper option after seeing results",
         "message": "Those are too expensive. Show me something cheaper.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -2944,6 +3075,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Change brand preference after seeing results",
         "message": "Actually I'd prefer Apple. Can you show me Macs instead?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2957,6 +3089,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Add a spec requirement after seeing results",
         "message": "I also need at least 1TB storage. Can you narrow those down?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2970,6 +3103,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "More options in same budget",
         "message": "Can you show me more options in the same price range?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -2983,6 +3117,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Exclude a brand from results shown",
         "message": "None of the HP ones — I've had bad luck with them. Show me the others.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["HP"],
         "expect_filters": [],
@@ -2996,6 +3131,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Ask for lighter options after seeing heavy ones",
         "message": "These all look pretty heavy. Do you have any lighter ones?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -3009,6 +3145,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Revert to earlier preference",
         "message": "Actually, forget the Mac preference — any brand is fine",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -3041,6 +3178,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Impossible spec for price",
         "message": "I need a laptop with RTX 4090 mobile under $300",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": ["budget"],
@@ -3056,6 +3194,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Request for out-of-stock specific model",
         "message": "I specifically want the ASUS ROG Zephyrus G16 2024",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -3069,6 +3208,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Exclude all known brands",
         "message": "I don't want Dell, HP, Lenovo, ASUS, Apple, or Acer. What else do you have?",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": ["Dell", "HP", "Lenovo", "ASUS", "Apple", "Acer"],
         "expect_filters": [],
@@ -3082,6 +3222,7 @@ QUERIES: List[Dict[str, Any]] = [
         "label": "Price floor that eliminates catalog",
         "message": "I only buy premium laptops. Nothing under $3000.",
         "expect_recs_on_first": True,
+        "expect_explain": True,
         "expect_question": False,
         "must_not_contain_brands": [],
         "expect_filters": [],
@@ -3170,9 +3311,9 @@ Example C (score 2/10):
   → Engagement: 1, Tone: 2, Accuracy: 0 (Final Cut Pro is Mac-only) = 3 → score 0.3
 
 == OUTPUT ==
-First write a brief reasoning (2–3 sentences, one per step).
-Then output EXACTLY this JSON on the last line:
+First output EXACTLY this JSON on its own line:
 {"score": <0-10>, "reason": "<≤12 words summarizing the key issue>"}
+Then write a brief reasoning (2–3 sentences, one per step).
 """
 
 GEVAL_USER_TEMPLATE = """\
@@ -3375,6 +3516,77 @@ def check_disclosure(q: Dict, resp: Dict) -> Tuple[Optional[float], str]:
     )
 
 
+def check_explainability(q: Dict, resp: Dict) -> Tuple[Optional[float], str]:
+    """
+    Deterministic explainability check: does the recommendation response explain
+    why products were chosen?  Only fires when q["expect_explain"] is True
+    (set on queries where expect_recs_on_first=True).
+
+    Three binary sub-checks, each contributing 1/3 to the final score [0,1]:
+
+    Check 1 — Bullet or connective presence:
+        Message contains a bullet marker (bullet point, dash-space, asterisk-space)
+        or a numbered list item, OR uses an explanatory connective ("because",
+        "since", "which means", "so you get", "giving you").
+        Rationale: _explain_best_value() and _generate_why_picked() both produce
+        dash-bullet lines; this check verifies they reach the final response.
+
+    Check 2 — Specific product attribute mentioned:
+        At least one attribute keyword in the lowercased message: price, ram,
+        battery, rating, storage, screen, display, ssd, memory, weight,
+        processor, cpu, gpu.
+        Rationale: a response that recommends but never names a spec gives the
+        user no actionable reason to prefer one product over another.
+
+    Check 3 — Constraint/filter disclosure:
+        At least one of: "under $", "at least", "with at least", "matching your",
+        "within your", "your budget", "no ", "excluding", "based on your".
+        Rationale: agent should surface which user constraints it applied
+        (see generate_recommendation_explanation() + query_rewriter notes).
+
+    Returns (None, "N/A...") when expect_explain is not set on the query.
+    Returns (float, note_str): float = fraction of checks passing (0, 0.33, 0.67, 1.0).
+    """
+    if not q.get("expect_explain"):
+        return None, "N/A — expect_explain not set"
+
+    msg = (resp.get("message") or "").lower()
+
+    # Check 1: bullet marker or explanatory connective
+    _BULLET_MARKERS = ("•", "- ", "* ")
+    _CONNECTIVES = ("because", "since", "which means", "so you get", "giving you")
+    has_bullets = (
+        any(m in msg for m in _BULLET_MARKERS)
+        or bool(re.search(r"^\s*\d+\.", msg, re.MULTILINE))
+    )
+    c1 = 1 if (has_bullets or any(c in msg for c in _CONNECTIVES)) else 0
+
+    # Check 2: specific product attribute keyword
+    _ATTR_KEYWORDS = (
+        "price", "ram", "gb ram", "battery", "rating", "storage",
+        "screen", "display", "ssd", "memory", "weight", "processor", "cpu", "gpu",
+    )
+    c2 = 1 if any(kw in msg for kw in _ATTR_KEYWORDS) else 0
+
+    # Check 3: constraint/filter disclosure phrase
+    _CONSTRAINT_PH = (
+        "under $", "at least", "with at least", "matching your",
+        "within your", "your budget", "no ", "excluding", "based on your",
+    )
+    c3 = 1 if any(ph in msg for ph in _CONSTRAINT_PH) else 0
+
+    score = round((c1 + c2 + c3) / 3.0, 4)
+    checks = [("bullets", c1), ("attr_mention", c2), ("constraint_disc", c3)]
+    passed = [name for name, val in checks if val]
+    failed = [name for name, val in checks if not val]
+    note = (
+        f"✓ explain {score:.2f}: all 3 checks passed"
+        if not failed
+        else f"~ explain {score:.2f}: passed={passed} missing={failed}"
+    )
+    return score, note
+
+
 # ============================================================================
 # Async agent call
 # ============================================================================
@@ -3438,7 +3650,7 @@ async def score_quality_async(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
-            max_tokens=200,
+            max_tokens=400,  # 200 was too low; reasoning alone ~150 tok left <50 for JSON
         )
         # Track token usage for cost reporting (gpt-4o-mini: $0.150/1M in, $0.600/1M out)
         usage: Dict[str, int] = {
@@ -3446,13 +3658,17 @@ async def score_quality_async(
             "completion_tokens": getattr(completion.usage, "completion_tokens", 0) or 0,
         }
         raw = completion.choices[0].message.content.strip()
-        # Extract last JSON line
-        for line in reversed(raw.splitlines()):
+        # JSON now appears first in output; scan forward, skip malformed lines
+        for line in raw.splitlines():
             line = line.strip()
             if line.startswith("{"):
-                data = json.loads(line)
-                score_10 = float(data.get("score", 5))
-                return max(0.0, min(10.0, score_10)) / 10.0, data.get("reason", ""), usage
+                try:
+                    data = json.loads(line)
+                    if "score" in data:
+                        score_10 = float(data["score"])
+                        return max(0.0, min(10.0, score_10)) / 10.0, data.get("reason", ""), usage
+                except json.JSONDecodeError:
+                    continue
         return 0.5, f"parse error: {raw[-80:]}", usage
     except Exception as e:
         return 0.5, f"scoring error: {e}", _zero_usage
@@ -3469,6 +3685,7 @@ def compute_final_score(
     quality_score: float,
     stock_score: Optional[float] = None,
     disclosure_score: Optional[float] = None,
+    explain_score: Optional[float] = None,
 ) -> float:
     """
     Weighted combination of scoring components.
@@ -3492,12 +3709,17 @@ def compute_final_score(
        5% — Availability (deterministic, only when recommendations present):
              Never recommend out-of-stock products. Small weight because our store
              mostly filters them already; redistributes to quality when N/A.
-      25% — LLM quality score (engagement + tone + accuracy):
+      10% — Explainability (deterministic, only when expect_explain=True):
+             Checks that the response contains explanation bullets/connectives,
+             at least one specific product attribute (RAM, battery, price…), and
+             explicit constraint disclosure. Score = checks_passed / 3.
+             Redistributes to quality when N/A (e.g., clarification queries).
+      15% — LLM quality score (engagement + tone + accuracy):
              Covers everything deterministic checks don't: empathy, correctness of
              advice, tone matching (casual vs technical), handling misconceptions.
 
     Effective weights for most queries (no brand exclusion, no filter check):
-      type=40%, stock=5% (if recs), quality=55%  (w_quality = 1.0 - 0.40 - 0.05)
+      type=40%, stock=5%, explain=10%, quality=45%
     For catalog_impossible group (disclosure active, brand N/A):
       type=40%, disclosure=20%, filter=10% (if recs), stock=5% (if recs), quality=25%
 
@@ -3509,7 +3731,8 @@ def compute_final_score(
     w_disclosure = 0.20 if disclosure_score is not None else 0.0
     w_filter     = 0.10 if filter_score     is not None else 0.0
     w_stock      = 0.05 if stock_score      is not None else 0.0
-    w_quality    = 1.0 - w_type - w_brand - w_disclosure - w_filter - w_stock
+    w_explain    = 0.10 if explain_score    is not None else 0.0
+    w_quality    = 1.0 - w_type - w_brand - w_disclosure - w_filter - w_stock - w_explain
 
     total = w_type * type_score
     if brand_score is not None:
@@ -3520,6 +3743,8 @@ def compute_final_score(
         total += w_filter * filter_score
     if stock_score is not None:
         total += w_stock * stock_score
+    if explain_score is not None:
+        total += w_explain * explain_score
     total += w_quality * quality_score
 
     return round(max(0.0, min(1.0, total)), 4)
@@ -3680,6 +3905,7 @@ async def run_geval_async(
                 "id": q["id"], "group": q["group"], "label": q["label"],
                 "message": q["message"], "score": 0.0, "type_score": 0.0,
                 "brand_score": None, "filter_score": None, "quality_score": 0.0,
+                "explain_score": None, "explain_note": "",
                 "type_note": err, "brand_note": "", "filter_note": "", "reason": err,
                 "elapsed_ms": 0, "response_type": "error", "n_recs": 0,
             }
@@ -3689,11 +3915,12 @@ async def run_geval_async(
         filter_score, filter_note = check_filters_extracted(q, resp)
         stock_score, stock_note = check_availability(q, resp)
         disclosure_score, disclosure_note = check_disclosure(q, resp)
+        explain_score, explain_note = check_explainability(q, resp)
         quality_score, reason, usage = await score_quality_async(oai, q, resp)
 
         final = compute_final_score(
             type_score, brand_score, filter_score, quality_score,
-            stock_score, disclosure_score,
+            stock_score, disclosure_score, explain_score,
         )
 
         n_recs = sum(len(r) for r in (resp.get("recommendations") or []))
@@ -3714,6 +3941,8 @@ async def run_geval_async(
             "filter_note": filter_note,
             "stock_note": stock_note,
             "disclosure_note": disclosure_note,
+            "explain_score": explain_score,
+            "explain_note": explain_note,
             "reason": reason,
             "elapsed_ms": item["elapsed_ms"],
             "response_type": rtype,
@@ -3871,12 +4100,16 @@ async def run_geval_async(
     # Per-group breakdown
     groups = sorted(set(r["group"] for r in scored))
     print(f"  Table 3: Per-group breakdown")
-    print(f"  {'Group':<20} {'N':>4}  {'Avg':>7}  {'Pass%':>7}  {'TypeAcc%':>9}")
-    print(f"  {'─'*52}")
+    print(f"  {'Group':<20} {'N':>4}  {'Avg':>7}  {'±SE':>7}  {'Pass%':>7}  {'TypeAcc%':>9}")
+    print(f"  {'─'*62}")
     for g in groups:
         subset = [r for r in scored if r["group"] == g]
         n, avg, pct, tacc = stats(subset)
-        print(f"  {g:<20} {n:>4}  {avg:>7.3f}  {pct:>6.1f}%  {tacc:>8.1f}%")
+        # Within-group SE = SD of scores / sqrt(n); SD=0 when n=1
+        _g_scores = [r["score"] for r in subset]
+        _g_sd = statistics.stdev(_g_scores) if n > 1 else 0.0
+        _g_se = _g_sd / math.sqrt(n) if n > 0 else 0.0
+        print(f"  {g:<20} {n:>4}  {avg:>7.3f}  {_g_se:>7.4f}  {pct:>6.1f}%  {tacc:>8.1f}%")
     print()
 
     # Score distribution histogram
@@ -3934,9 +4167,11 @@ async def run_geval_async(
         print(f"  {'─'*52}")
         _mean_avg = sum(_per_run_avgs) / runs
         _sd_avg = statistics.stdev(_per_run_avgs) if runs > 1 else 0.0
+        _se_avg = _sd_avg / math.sqrt(runs) if runs > 1 else 0.0
         _mean_pass = sum(_per_run_pass) / runs
         _sd_pass = statistics.stdev(_per_run_pass) if runs > 1 else 0.0
-        print(f"  {'Mean':<6}  {_mean_avg:>8.4f} ± {_sd_avg:.4f}  {_mean_pass:>5.1f}% ± {_sd_pass:.1f}pp")
+        _se_pass = _sd_pass / math.sqrt(runs) if runs > 1 else 0.0
+        print(f"  {'Mean':<6}  {_mean_avg:>8.4f} ± {_se_avg:.4f} (SE)  {_mean_pass:>5.1f}% ± {_se_pass:.1f}pp (SE)")
         print(f"  Macro PASS@{runs} (avg per-query pass rate): {_macro_pass_at_k:.4f}")
         print()
         _pass_at_k_data = {
@@ -3946,8 +4181,10 @@ async def run_geval_async(
             "per_run_pass_pct": [round(p, 2) for p in _per_run_pass],
             "mean_avg": round(_mean_avg, 4),
             "sd_avg": round(_sd_avg, 4),
+            "se_avg": round(_se_avg, 4),
             "mean_pass_pct": round(_mean_pass, 2),
             "sd_pass_pct": round(_sd_pass, 2),
+            "se_pass_pct": round(_se_pass, 2),
         }
 
     # ── Save JSON ──────────────────────────────────────────────────────────

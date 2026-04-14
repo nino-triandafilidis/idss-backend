@@ -395,6 +395,10 @@ class InterviewSessionManager:
         prevents stale keys like ``good_for_ml=True`` from persisting after the
         user switches use-case.  Default is merge (backward-compatible).
 
+        Callers always pass ``agent.get_search_filters()`` which is the
+        *complete* canonical filter set from the agent — so full replacement is
+        correct (the agent is the source of truth).
+
         In merge mode, excluded_brands is EXTENDED (accumulated) across turns so
         that "no HP" on turn 1 + "no Dell" on turn 2 = ["HP", "Dell"].
         All other slots are replaced (e.g. new budget overwrites old budget).

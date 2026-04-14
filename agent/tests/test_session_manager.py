@@ -168,3 +168,4 @@ def test_excluded_brands_accumulate_string_and_list_inputs():
     assert "Acer" in result, f"Acer missing: {result}"
     assert "Dell" in result, f"Dell missing: {result}"
     assert result.count("HP") == 1, f"HP duplicated: {result}"
+

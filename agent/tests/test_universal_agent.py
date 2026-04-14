@@ -12,7 +12,7 @@ Covers:
 import pytest
 import pytest
 from unittest.mock import MagicMock
-from agent.universal_agent import UniversalAgent
+from agent.universal_agent import UniversalAgent, _apply_vague_refinement_heuristics
 from agent.domain_registry import get_domain_schema
 
 
@@ -406,4 +406,58 @@ def test_explicit_rec_request_wants_recommendations(msg):
     assert _is_explicit and msg_words >= 3, (
         f"Explicit-rec-request not detected for: {msg!r}. "
         f"is_explicit={_is_explicit}, words={msg_words}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Vague refinement heuristics — _apply_vague_refinement_heuristics()
+# ---------------------------------------------------------------------------
+
+def test_cheaper_scales_existing_budget_down_20pct():
+    """'cheaper' with a prior budget must reduce price_max_cents by 20%."""
+    filters = {"price_max_cents": 150000, "brand": "Dell"}
+    result = _apply_vague_refinement_heuristics("something cheaper please", filters)
+    assert result["price_max_cents"] == 120000, (
+        f"Expected 120000, got {result['price_max_cents']}"
+    )
+    # Other slots must be untouched
+    assert result["brand"] == "Dell"
+
+
+def test_cheaper_with_no_prior_budget_leaves_filters_unchanged():
+    """'cheaper' with no prior budget must NOT invent a new budget constraint."""
+    filters = {"brand": "Lenovo"}
+    result = _apply_vague_refinement_heuristics("I want something more affordable", filters)
+    assert "price_max_cents" not in result, (
+        f"Heuristic invented a budget when none existed: {result}"
+    )
+    assert result["brand"] == "Lenovo"
+
+
+def test_lighter_adds_screen_size_max():
+    """'lighter' must add screen_size_max_inches=14.0 when no tighter constraint exists."""
+    filters = {"price_max_cents": 100000}
+    result = _apply_vague_refinement_heuristics("something lighter and more portable", filters)
+    assert result.get("screen_size_max_inches") == 14.0, (
+        f"Expected screen_size_max_inches=14.0, got {result}"
+    )
+
+
+def test_lighter_does_not_loosen_existing_tight_screen_constraint():
+    """'lighter' must NOT loosen a screen constraint that is already ≤ 14"."""
+    filters = {"price_max_cents": 80000, "screen_size_max_inches": 13.3}
+    result = _apply_vague_refinement_heuristics("lighter", filters)
+    # 13.3 is already tighter than 14.0 — must remain unchanged
+    assert result["screen_size_max_inches"] == 13.3, (
+        f"Heuristic over-wrote tighter screen constraint: {result}"
+    )
+
+
+def test_faster_bumps_ram_and_removes_budget_ceiling():
+    """'more powerful' must increase min_ram_gb by 8 and remove price_max_cents."""
+    filters = {"min_ram_gb": 16, "price_max_cents": 120000}
+    result = _apply_vague_refinement_heuristics("I need something more powerful", filters)
+    assert result["min_ram_gb"] == 24, f"Expected 24 GB RAM, got {result['min_ram_gb']}"
+    assert "price_max_cents" not in result, (
+        f"price_max_cents should be removed for 'more powerful': {result}"
     )

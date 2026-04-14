@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 # Model configuration — single model for all LLM calls, set via environment
@@ -213,7 +214,14 @@ async def detect_post_rec_intent(message: str) -> str:
         )
         if any(sig in lower for sig in _TARGETED_SIGNALS):
             return "targeted_qa"
-        _no_anaphora = not any(ref in lower for ref in ("these", " them", "those", "current", "shown"))
+        # Use word-boundary regex for "them" so sentence-initial "Them being expensive..."
+        # is caught correctly.  The old " them" substring required a leading space
+        # and missed sentence-start position.
+        _no_anaphora = (
+            not re.search(r'\b(these|those|them)\b', lower)
+            and "current" not in lower
+            and "shown" not in lower
+        )
         _has_specs = any(sig in lower for sig in ("rtx ", "gtx ", "ryzen", "i7", "i9", "i5", "32gb", "16gb", "ram", "budget"))
         _has_new_intent = any(sig in lower for sig in ("i want to play", "i need a laptop for", "looking for a laptop that", "need rtx", "gaming laptop with"))
         if _no_anaphora and (_has_new_intent or (_has_specs and ("$" in lower or "budget" in lower))):

@@ -353,6 +353,24 @@ _CASUAL_PURCHASE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# More precise purchase-idiom matchers (Baani PR #23):
+# _PURCHASE_IDIOMS_RE: purchase verb + ordinal, without requiring cart vocabulary.
+# Covers "I'll take the second one", "give me the third", etc.
+# Excludes "it"/"that" (no ordinal) — those are handled by _CASUAL_TAKE_DEFAULT_RE below.
+_PURCHASE_IDIOMS_RE = re.compile(
+    r"\b(?:i'?ll\s+take|i\s+want|give\s+me|i'?d\s+like|get\s+me)\s+"
+    r"(?:the\s+)?(?:first|second|third|fourth|1st|2nd|3rd|4th)\b",
+    re.IGNORECASE,
+)
+
+# Anchored fullmatch for bare "I'll take it / I'll take that".
+# fullmatch() anchors at both ends so it never fires inside a longer sentence
+# ("I'll take it if it has 32GB RAM" → no match — prevents false cart additions).
+_CASUAL_TAKE_DEFAULT_RE = re.compile(
+    r"i'?ll\s+take\s+(?:it|that|that\s+one)\.?",
+    re.IGNORECASE,
+)
+
 
 def _normalize_for_cache(text: str) -> str:
     t = text.lower().strip()
@@ -1306,6 +1324,48 @@ def _explain_best_value(product: dict, domain: str, all_products: Optional[list]
     return f"**{name}** is the best value pick:\n\n{bullets_md}{cons_md}"
 
 
+def _message_references_shown_recommendation_set(message: str) -> bool:
+    """Return True when the message contains anaphoric references to the currently
+    shown recommendation set ("these", "those", "compare them", "the second").
+
+    Used as a safety veto: if the LLM router returns ``new_search`` but the message
+    clearly refers to products already on screen, downgrade the intent to
+    ``targeted_qa`` instead of wiping the session.  Session reset is destructive
+    and hard to recover from — conservative downgrade is the safer default.
+
+    Design notes:
+    - "these"/"those" are strong demonstratives — they almost always reference the
+      shown set when used in a post-recommendation follow-up.
+    - "them" is kept only in clear comparative/reference context to avoid false
+      positives on "one of them gaming laptops" (informal new-search phrasing).
+    - Ordinals require "the" or "option" prefix to avoid matching ordinals in
+      unrelated contexts ("First, I'd like to know the price").
+    - Known false-positive risk: "These pricing models are expensive, show me cheaper"
+      contains "these" but is a genuine new_search. No test covers this yet; the
+      veto is conservative (targeted_qa) so the worst outcome is one extra answer.
+    """
+    lower = message.lower()
+    # Strong demonstratives — nearly always reference the shown recommendation set
+    if re.search(r'\b(these|those)\b', lower):
+        return True
+    # "them" only in clear comparative/reference context.
+    # "of them" is intentionally excluded — "one of them gaming laptops" is informal
+    # new-search phrasing, not a reference to the shown set.
+    # "all of them" is included because "all" implies a bounded, visible set.
+    if re.search(r'\b(compare|between|all\s+of)\s+them\b', lower):
+        return True
+    if re.search(r'\bthem\s+(vs\.?|versus|against)\b', lower):
+        return True
+    # Ordinal references to a specific shown item — "the second", "option 3"
+    if re.search(
+        r"\b(?:the\s+(?:first|second|third|fourth|1st|2nd|3rd|4th)|"
+        r"option\s+(?:first|second|third|fourth|1st|2nd|3rd|4th|[1-4]))\b",
+        lower,
+    ):
+        return True
+    return False
+
+
 # ============================================================================
 # Post-Recommendation Handlers
 # ============================================================================
@@ -1416,6 +1476,7 @@ async def _handle_post_recommendation(
         "contrast",                    # "contrast X and Y"
         "how does it compare",         # "how does this compare to the others?"
         "lay them out",                # informal: "can you lay them out side by side?"
+        "lay these out",               # anaphoric "these" variant: "lay these out side by side"
         "side by side",
         "break down the differences",
         "what sets them apart",
@@ -1506,13 +1567,34 @@ async def _handle_post_recommendation(
         # specs (e.g. "add Lenovo IdeaPad L340 Gaming Laptop, 15.6 Inch FHD to cart")
         # don't get misclassified as "new_search" and wipe the session.
         intent = "add_to_cart"
-    elif _CASUAL_PURCHASE_RE.search(msg_lower):
-        # Casual purchase: "I'll take the second one", "let me get that", "give me the first"
-        # The existing compound-keyword check requires an explicit container word (cart/bag/…).
-        # These phrases miss it, so they fall through to LLM which misroutes them as new_search.
+    elif (
+        _PURCHASE_IDIOMS_RE.search(msg_lower)
+        or _CASUAL_TAKE_DEFAULT_RE.fullmatch(clean_message)
+        or _CASUAL_PURCHASE_RE.search(msg_lower)
+    ):
+        # Purchase without explicit cart vocabulary: "I'll take the second one",
+        # "give me the first", or the anchored bare idiom "I'll take it."
+        # _CASUAL_TAKE_DEFAULT_RE uses fullmatch() to prevent matching inside
+        # conditional clauses ("I'll take it if it has 32GB RAM" → no match).
         intent = "add_to_cart"
     else:
         intent = await detect_post_rec_intent(clean_message)
+
+    # -----------------------------------------------------------------------
+    # Anaphora veto: if the LLM router returned new_search but the message
+    # contains demonstratives or ordinals that reference the current shown set
+    # ("these", "those", "compare them", "the second"), the model was likely
+    # wrong.  Downgrade to targeted_qa — this answers about visible products
+    # and is fully recoverable.  Session reset is destructive; err on the side
+    # of one extra answer over losing all accumulated user preferences.
+    # -----------------------------------------------------------------------
+    if intent == "new_search" and _message_references_shown_recommendation_set(clean_message):
+        logger.info(
+            "anaphora_veto",
+            "new_search downgraded to targeted_qa — message references shown products",
+            {"session_id": session_id, "msg_preview": clean_message[:80]},
+        )
+        intent = "targeted_qa"
 
     # -----------------------------------------------------------------------
     # New-search intent: user sent a completely fresh product query unrelated

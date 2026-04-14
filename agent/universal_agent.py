@@ -280,12 +280,17 @@ def _detect_excluded_brands(message: str) -> List[str]:
     """
     # Enhanced pattern: covers direct, indirect, and multi-word exclusion phrases.
     # Additions over v1: steer clear of, bad/terrible experience with, exclude, without.
+    # The optional suffix `(?:\s+experiences?\s+with)?` consumes bridging phrases
+    # like "bad experiences with Dell" (plural) so the capture group lands on "Dell"
+    # not "experiences".  False positives ("poor battery life") are filtered
+    # downstream — "battery" is not a known brand name.
     # Character class includes comma/semicolon so comma-separated lists like
     # "no HP, Acer, or Dell" are captured as one group and split below.
     _excl_kw_pat = re.compile(
-        r'(?:no|not|never|anything\s+but|avoid|hate|refuse|skip|exclude|excluded|without|'
-        r'steer\s+clear\s+of|bad\s+experience\s+with|terrible\s+experience\s+with)\s+'
-        r'([A-Za-z][A-Za-z0-9\-,; ]{1,60})',
+        r'(?:no|not|never|anything\s+but|avoid|hate|refuse|bad|terrible|poor|skip|'
+        r'exclude|excluded|without|steer\s+clear\s+of)'
+        r'(?:\s+experiences?\s+with)?'
+        r'\s+([A-Za-z][A-Za-z0-9\-,; ]{1,60})',
         re.IGNORECASE,
     )
     excl_brands: List[str] = []
@@ -443,6 +448,65 @@ def _extract_excluded_screen_sizes_from_text(message: str) -> List[float]:
         if 10.0 <= val <= 21.0 and val not in out:
             out.append(val)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Vague refinement heuristics — applied when LLM can't extract a numeric value
+# ---------------------------------------------------------------------------
+
+_CHEAPER_PAT = re.compile(
+    r'\b(?:cheaper|more\s+affordable|lower\s+(?:budget|price)|less\s+expensive|budget[- ]friendly)\b',
+    re.IGNORECASE,
+)
+_LIGHTER_PAT = re.compile(
+    r'\b(?:lighter|more\s+portable|smaller|compact)\b',
+    re.IGNORECASE,
+)
+_FASTER_PAT = re.compile(
+    r'\b(?:more\s+powerful|faster|more\s+performance|higher[- ]end|beefier)\b',
+    re.IGNORECASE,
+)
+
+
+def _apply_vague_refinement_heuristics(message: str, filters: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply heuristic deltas for vague refinement adjectives when LLM produced no numeric update.
+
+    Rules (only applied when relevant prior slot exists — never invents new constraints):
+    - "cheaper / more affordable / lower budget"  → scale price_max_cents down by 20%
+    - "lighter / more portable / smaller"         → constrain screen_size_max_inches to 14"
+                                                    (only if no prior screen constraint tighter)
+    - "more powerful / faster / higher-end"       → bump min_ram_gb by +8 GB;
+                                                    remove price_max_cents ceiling
+    Returns a copy of filters with deltas applied.
+    """
+    updated = dict(filters)
+
+    if _CHEAPER_PAT.search(message):
+        prior_budget = updated.get("price_max_cents")
+        if prior_budget is not None:
+            try:
+                new_budget = int(float(str(prior_budget)) * 0.80)
+                updated["price_max_cents"] = new_budget
+            except (ValueError, TypeError):
+                pass  # malformed value — leave unchanged
+
+    if _LIGHTER_PAT.search(message):
+        # Only tighten if no existing constraint is already ≤ 14"
+        existing_max = updated.get("screen_size_max_inches")
+        if existing_max is None or float(str(existing_max)) > 14.0:
+            updated["screen_size_max_inches"] = 14.0
+
+    if _FASTER_PAT.search(message):
+        prior_ram = updated.get("min_ram_gb")
+        if prior_ram is not None:
+            try:
+                updated["min_ram_gb"] = int(float(str(prior_ram))) + 8
+            except (ValueError, TypeError):
+                pass
+        # Remove the price ceiling so more powerful (likely more expensive) laptops appear
+        updated.pop("price_max_cents", None)
+
+    return updated
 
 
 # Model configuration — single model for all LLM calls, set via environment
@@ -2015,6 +2079,11 @@ Write the recommendation message."""}
                         else:
                             self.filters.pop("excluded_brands", None)
                         logger.info(f"Refinement mind-change: purged {_preferred_brand} from excluded_brands")
+                # Vague-adjective fallback: if LLM extracted nothing numeric but the
+                # message contains e.g. "cheaper"/"lighter"/"faster", apply heuristic deltas
+                # so the search actually changes rather than repeating identical results.
+                self.filters = _apply_vague_refinement_heuristics(message, self.filters)
+
                 self.history.append({"role": "user", "content": message})
                 schema = get_domain_schema(self.domain)
                 return self._handoff_to_search(schema)
